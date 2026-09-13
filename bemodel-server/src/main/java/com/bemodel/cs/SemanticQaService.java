@@ -1,0 +1,632 @@
+package com.bemodel.cs;
+
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.bemodel.common.BizException;
+import com.bemodel.datasource.entity.Mapping;
+import com.bemodel.datasource.entity.PhysicalTable;
+import com.bemodel.datasource.mapper.MappingMapper;
+import com.bemodel.datasource.mapper.PhysicalTableMapper;
+import com.bemodel.datasource.service.DatasourceService;
+import com.bemodel.llm.DeepSeekClient;
+import com.bemodel.ontology.entity.Attribute;
+import com.bemodel.ontology.entity.Concept;
+import com.bemodel.ontology.entity.Relation;
+import com.bemodel.ontology.mapper.AttributeMapper;
+import com.bemodel.ontology.mapper.ConceptMapper;
+import com.bemodel.ontology.mapper.RelationMapper;
+import com.bemodel.ontology.service.MissService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.stereotype.Service;
+
+import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * 语义层驱动的开放问答（Ontology2SQL）：LLM 基于本体+映射生成查询计划，
+ * SQL 经表白名单/列白名单/只读校验后在真实业务库执行，再由 LLM 把结果组织成自然语言。
+ * 原则：LLM 只表达不编数——数字必须来自真实查询；任一环节失败返回 null 落能力菜单。
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class SemanticQaService {
+
+    private final ConceptMapper conceptMapper;
+    private final AttributeMapper attributeMapper;
+    private final RelationMapper relationMapper;
+    private final MappingMapper mappingMapper;
+    private final PhysicalTableMapper physicalTableMapper;
+    private final DatasourceService datasourceService;
+    private final DeepSeekClient deepSeekClient;
+    private final ObjectMapper objectMapper;
+    private final MissService missService;
+
+    /** 查询计划：LLM 产出的结构化意图（QUERY 查数 / MODEL_ANSWER 模型规则判断 / UNANSWERABLE） */
+    record Plan(String mode, String ds, String sql, String semantics, String reason,
+                String conclusion, String verifySql) {
+    }
+
+    /** 问答结果：result 为 null 表示降级落能力菜单；recordedMiss 标记本次是否已回流增长回路 */
+    public record Outcome(Map<String, Object> result, boolean recordedMiss) {
+    }
+
+    /**
+     * 开放问答主流程：计划 → 校验 → 执行 → 作答。
+     * UNANSWERABLE / SQL 校验失败 / 执行失败会把问题原文回流本体增长回路（kind=QUESTION）；
+     * 计划解析失败/LLM 不可用不记（非语义层缺口）。
+     */
+    public Outcome answer(String q) {
+        Plan plan = planQuery(q);
+        if (plan == null) {
+            return new Outcome(null, false);
+        }
+        if ("UNANSWERABLE".equals(plan.mode())) {
+            recordQuestionMiss(q);
+            return new Outcome(null, true);
+        }
+        if ("MODEL_ANSWER".equals(plan.mode())) {
+            return new Outcome(modelAnswer(q, plan), false);
+        }
+        if (!"QUERY".equals(plan.mode()) || plan.ds() == null || plan.sql().isBlank()) {
+            return new Outcome(null, false);
+        }
+        Set<String> tables = allowedTables(plan.ds());
+        Set<String> columns = allowedColumns(plan.ds());
+        if (tables.isEmpty()) {
+            recordQuestionMiss(q);
+            return new Outcome(null, true);
+        }
+        String sql;
+        try {
+            sql = validateSql(plan.sql(), tables, columns);
+        } catch (BizException e) {
+            log.warn("语义查询 SQL 校验未过（降级能力菜单）: {}", e.getMessage());
+            recordQuestionMiss(q);
+            return new Outcome(null, true);
+        }
+        List<Map<String, Object>> rows;
+        try {
+            // 不污染共享 JdbcTemplate：基于同一 DataSource 包一层带超时/行数上限的执行器
+            JdbcTemplate jdbc = new JdbcTemplate(datasourceService.jdbc(plan.ds()).getDataSource());
+            jdbc.setQueryTimeout(15);
+            jdbc.setMaxRows(100);
+            rows = jdbc.queryForList(sql);
+        } catch (Exception e) {
+            log.warn("语义查询执行失败（降级能力菜单）: {}", e.getMessage());
+            recordQuestionMiss(q);
+            return new Outcome(null, true);
+        }
+        int total = rows.size();
+        List<Map<String, Object>> view = rows.size() > 20 ? rows.subList(0, 20) : rows;
+        String answer = composeAnswer(q, plan, sql, view, total).orElseGet(
+                () -> templateAnswer(plan, total, view));
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("question", q);
+        result.put("intent", "语义查询");
+        result.put("router", "SEMANTIC");
+        result.put("answer", answer);
+        List<String> usedTables = tables.stream()
+                .filter(t -> Pattern.compile("(?i)\\b" + Pattern.quote(t) + "\\b").matcher(sql).find())
+                .toList();
+        result.put("evidence", List.of(
+                Map.of("label", "执行SQL", "value", sql),
+                Map.of("label", "数据源", "value", plan.ds() + " / " + String.join(",", usedTables)),
+                Map.of("label", "结果行数", "value", total + (total > 20 ? "（展示前20行）" : ""))));
+        result.put("links", conceptLinks(plan.ds(), usedTables));
+        return new Outcome(result, false);
+    }
+
+    /** 答不了的问题回流本体增长回路（kind=QUESTION/source=CS_ASK，静默降级在 recordMiss 内部） */
+    private void recordQuestionMiss(String q) {
+        missService.recordMiss(q, "QUESTION", "CS_ASK");
+    }
+
+    /**
+     * 模型作答：「可不可以/能不能」类业务规则问题，从本体结构推理结论，
+     * verifySql 探针可选——校验或执行失败只丢探针，保留结构结论。
+     */
+    private Map<String, Object> modelAnswer(String q, Plan plan) {
+        if (plan.conclusion() == null || plan.conclusion().isBlank()) {
+            return null;
+        }
+        String probeSql = null;
+        List<Map<String, Object>> probeRows = null;
+        Set<String> tables = plan.ds() == null ? Set.of() : allowedTables(plan.ds());
+        if (plan.verifySql() != null && !plan.verifySql().isBlank() && !tables.isEmpty()) {
+            try {
+                probeSql = validateSql(plan.verifySql(), tables, allowedColumns(plan.ds()));
+                JdbcTemplate jdbc = new JdbcTemplate(datasourceService.jdbc(plan.ds()).getDataSource());
+                jdbc.setQueryTimeout(15);
+                jdbc.setMaxRows(100);
+                probeRows = jdbc.queryForList(probeSql);
+            } catch (Exception e) {
+                log.warn("模型作答探针失败（丢弃探针保留结构结论）: {}", e.getMessage());
+                probeSql = null;
+                probeRows = null;
+            }
+        }
+
+        final List<Map<String, Object>> probeFinal = probeRows;
+        String answer = composeModelAnswer(q, plan, probeSql, probeRows).orElseGet(() -> {
+            String base = plan.conclusion() + "（结构依据：" + plan.semantics() + "）";
+            return probeFinal == null ? base
+                    : base + " 验证探针返回：" + probeFinal.get(0);
+        });
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("question", q);
+        result.put("intent", "语义查询");
+        result.put("router", "SEMANTIC");
+        result.put("answer", answer);
+        List<Map<String, String>> evidence = new ArrayList<>();
+        evidence.add(Map.of("label", "结构依据", "value", plan.semantics()));
+        if (probeSql != null) {
+            evidence.add(Map.of("label", "执行SQL", "value", probeSql));
+            evidence.add(Map.of("label", "结果行数", "value",
+                    String.valueOf(probeRows.size()) + (probeRows.isEmpty() ? "" : "，首行 " + probeRows.get(0))));
+        }
+        result.put("evidence", evidence);
+        result.put("links", conceptLinksFromText(plan.semantics() + " " + plan.conclusion()));
+        return result;
+    }
+
+    /** 模型作答的 LLM 组织：结构判断 + 探针结果一起给，产出人话；失败由调用方回落模板 */
+    private Optional<String> composeModelAnswer(String q, Plan plan, String probeSql,
+                                                List<Map<String, Object>> probeRows) {
+        String probeText;
+        try {
+            probeText = probeSql == null ? "无（纯结构判断）"
+                    : probeSql + " → " + objectMapper.writeValueAsString(probeRows);
+        } catch (Exception e) {
+            probeText = "无（纯结构判断）";
+        }
+        return deepSeekClient.chat("CS_SEMANTIC_ANSWER",
+                "你是医院信息平台的业务规则解答助手。基于给定的本体结构判断与验证探针结果用中文回答，"
+                        + "先给「可以/不可以」的结论，再给依据（结构口径+探针数字），口语化，不超过200字。不要编造探针没有的数字。",
+                "用户问题：" + q + "\n本体结构判断：" + plan.semantics()
+                        + "\n初步结论：" + plan.conclusion() + "\n验证探针：" + probeText);
+    }
+
+    // ---------- 1. 语义上下文 ----------
+
+    /** 给 LLM 的紧凑语义上下文：PUBLISHED 概念及属性 + confirmed 映射（按数据源分组）+ 概念关系 */
+    String buildSemanticContext() {
+        List<Concept> concepts = conceptMapper.selectList(
+                new LambdaQueryWrapper<Concept>().eq(Concept::getStatus, "PUBLISHED"));
+        Map<String, String> conceptName = new LinkedHashMap<>();
+        concepts.forEach(c -> conceptName.put(c.getCode(), c.getName()));
+        List<Attribute> attrs = attributeMapper.selectList(null);
+        Map<String, String> attrName = new LinkedHashMap<>();
+        attrs.forEach(a -> attrName.put(a.getConceptCode() + "." + a.getAttrCode(), a.getAttrName()));
+
+        StringBuilder sb = new StringBuilder("【本体概念】\n");
+        for (Concept c : concepts) {
+            List<String> as = attrs.stream()
+                    .filter(a -> a.getConceptCode().equals(c.getCode()))
+                    .map(a -> a.getAttrName() + "/" + a.getDataType())
+                    .toList();
+            sb.append(c.getCode()).append('(').append(c.getName()).append(')')
+                    .append(as.isEmpty() ? "" : ": " + String.join(", ", as)).append('\n');
+        }
+
+        List<PhysicalTable> tables = physicalTableMapper.selectList(null);
+        Map<String, String> tableComment = new LinkedHashMap<>();
+        tables.forEach(t -> tableComment.put(t.getDsCode() + "." + t.getTableName(),
+                t.getTableComment() == null ? "" : t.getTableComment()));
+        List<Mapping> mappings = mappingMapper.selectList(
+                new LambdaQueryWrapper<Mapping>().eq(Mapping::getConfirmed, 1));
+        Map<String, Map<String, List<Mapping>>> byDsTable = new TreeMap<>();
+        for (Mapping m : mappings) {
+            byDsTable.computeIfAbsent(m.getDsCode(), k -> new TreeMap<>())
+                    .computeIfAbsent(m.getTableName(), k -> new ArrayList<>()).add(m);
+        }
+        sb.append("\n【物理映射】（概念.属性 = 数据源.表.列，枚举列为原始码=中文）\n");
+        for (Map.Entry<String, Map<String, List<Mapping>>> ds : byDsTable.entrySet()) {
+            sb.append(ds.getKey()).append(":\n");
+            for (Map.Entry<String, List<Mapping>> t : ds.getValue().entrySet()) {
+                String comment = tableComment.get(ds.getKey() + "." + t.getKey());
+                sb.append("  ").append(t.getKey())
+                        .append(comment == null || comment.isEmpty() ? "" : "（" + comment + "）").append(": ");
+                List<String> cols = new ArrayList<>();
+                for (Mapping m : t.getValue()) {
+                    StringBuilder col = new StringBuilder(m.getColumnName()).append('=')
+                            .append(m.getConceptCode()).append('.')
+                            .append(attrName.getOrDefault(
+                                    m.getConceptCode() + "." + m.getAttrCode(), m.getAttrCode()));
+                    if (m.getValueMap() != null && !m.getValueMap().isBlank()) {
+                        col.append('{').append(m.getValueMap()
+                                        .replace("{", "").replace("}", "").replace("\"", ""))
+                                .append('}');
+                    }
+                    cols.add(col.toString());
+                }
+                sb.append(String.join(", ", cols)).append('\n');
+            }
+        }
+
+        List<Relation> relations = relationMapper.selectList(null);
+        if (!relations.isEmpty()) {
+            sb.append("\n【概念关系】\n");
+            for (Relation r : relations) {
+                sb.append(r.getFromConcept()).append('(').append(conceptName.getOrDefault(r.getFromConcept(), ""))
+                        .append(")—").append(r.getRelationName()).append("→")
+                        .append(r.getToConcept()).append('(')
+                        .append(conceptName.getOrDefault(r.getToConcept(), "")).append(")\n");
+            }
+        }
+        return sb.toString();
+    }
+
+    // ---------- 2. 查询计划（LLM call 1） ----------
+
+    private Plan planQuery(String q) {
+        Optional<String> r = deepSeekClient.chat("CS_SEMANTIC_PLAN",
+                "你是医疗信息平台的本体语义查询规划器，把自然语言问题编译为只读 SQL。只返回JSON，不要多余文字。",
+                buildPlanPrompt(q));
+        if (r.isEmpty()) {
+            return null;
+        }
+        try {
+            String resp = r.get();
+            int start = resp.indexOf('{');
+            int end = resp.lastIndexOf('}');
+            JsonNode node = objectMapper.readTree(start >= 0 && end > start ? resp.substring(start, end + 1) : resp);
+            String mode = node.path("mode").asText("");
+            if ("UNANSWERABLE".equals(mode)) {
+                log.info("语义查询不可答: {}", node.path("reason").asText(""));
+                return new Plan(mode, null, null, null, node.path("reason").asText(""), null, null);
+            }
+            if ("MODEL_ANSWER".equals(mode)) {
+                String conclusion = node.path("conclusion").asText("").trim();
+                if (conclusion.isEmpty()) {
+                    return null;
+                }
+                return new Plan(mode, node.path("ds").asText("").trim(),
+                        null, node.path("semantics").asText(""), null,
+                        conclusion, node.path("verifySql").asText("").trim());
+            }
+            if (!"QUERY".equals(mode)) {
+                return null;
+            }
+            String ds = node.path("ds").asText("").trim();
+            String sql = node.path("sql").asText("").trim();
+            if (ds.isEmpty() || sql.isEmpty()) {
+                return null;
+            }
+            return new Plan(mode, ds, sql, node.path("semantics").asText(""), null, null, null);
+        } catch (Exception e) {
+            log.warn("语义查询计划解析失败（降级）: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private String buildPlanPrompt(String q) {
+        return buildSemanticContext()
+                + "\n规则：\n"
+                + "1. ds 与表名只能取【物理映射】段中列出的数据源编码和物理表名（如 DS_CHARGE 的 pay_record），"
+                + "概念 code 是语义名不是表名，严禁当作表名使用；列只能用该表 = 号左侧列出的物理列名。\n"
+                + "2. 枚举列把中文反解为原始码（如「已发药」→ status='1'）。\n"
+                + "3. SQL 必须以 SELECT 开头；单表优先，JOIN 只允许同一数据源内的表；必须带 LIMIT 且 ≤100。\n"
+                + "4. 统计类问题用 COUNT/SUM/AVG；明细问题列出关键列。\n"
+                + "5. 名称类条件（科室、药品、项目等）用 LIKE '%关键词%' 宽松匹配中文名称列"
+                + "（如 drug_name、item_name、dept 这类映射为名称属性的列），严禁拿编码列（如 drug_code、item_code）做中文匹配。\n"
+                + "6. 今天日期：" + LocalDate.now() + "（昨天/上周等相对时间据此换算；业务数据多在 2026-08 月，"
+                + "若用户问的时间显然无数据仍照常生成 SQL，不要编造）。\n"
+                + "7. 「可不可以/能不能/是否支持/是否允许」这类业务规则问题不要查数，返回模型作答："
+                + "{\"mode\":\"MODEL_ANSWER\",\"ds\":\"相关数据源编码\",\"semantics\":\"基于哪个概念/哪个关键属性的结构判断\","
+                + "\"conclusion\":\"可以/不可以 + 一句依据\",\"verifySql\":\"可选，验证该结构判断的探针SQL"
+                + "（同 QUERY 校验规则），没有把握就留空\"}。\n"
+                + "   示例：「多个患者的处方可以一起结算吗？」→ {\"mode\":\"MODEL_ANSWER\",\"ds\":\"DS_CHARGE\","
+                + "\"semantics\":\"SETTLEMENT(结算记录)按 inhos_no 维系：一张结算单对应一个患者的一次住院\","
+                + "\"conclusion\":\"不可以。结算单按单个患者的单次住院维系，不支持跨患者合并结算\","
+                + "\"verifySql\":\"SELECT COUNT(*) AS cnt, COUNT(DISTINCT inhos_no) AS patients FROM settlement\"}\n"
+                + "8. 语义层确实回答不了时返回 {\"mode\":\"UNANSWERABLE\",\"reason\":\"一句话原因\"}。\n"
+                + "\n用户问题：" + q + "\n"
+                + "只输出JSON：{\"mode\":\"QUERY\",\"ds\":\"数据源编码\",\"sql\":\"SELECT ...\",\"semantics\":\"一句话说明查了什么、用了哪些概念\"}";
+    }
+
+    // ---------- 3. SQL 安全校验（纯函数，表/列白名单由调用方给） ----------
+
+    private static final Set<String> FORBIDDEN = Set.of(
+            "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "REVOKE",
+            "REPLACE", "LOAD", "CALL", "EXEC", "EXECUTE", "HANDLER", "LOCK", "UNLOCK", "SET", "INTO", "OUTFILE");
+
+    private static final Set<String> KEYWORDS = Set.of(
+            "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "CROSS", "ON",
+            "GROUP", "BY", "ORDER", "HAVING", "LIMIT", "AS", "AND", "OR", "NOT", "IN", "IS", "NULL",
+            "LIKE", "BETWEEN", "EXISTS", "CASE", "WHEN", "THEN", "ELSE", "END", "DISTINCT", "UNION",
+            "ALL", "ASC", "DESC", "TRUE", "FALSE", "INTERVAL",
+            "COUNT", "SUM", "AVG", "MAX", "MIN", "NOW", "CURDATE", "CURRENT_DATE", "CURRENT_TIMESTAMP",
+            "DATE", "DATEDIFF", "DATE_FORMAT", "IFNULL", "IF", "COALESCE", "ROUND", "CAST", "CONCAT",
+            "SUBSTRING", "YEAR", "MONTH", "DAY", "CHAR", "SIGNED", "UNSIGNED", "DECIMAL");
+
+    private static final Pattern IDENT = Pattern.compile("[a-zA-Z_][a-zA-Z0-9_]*");
+    private static final Pattern FROM_JOIN = Pattern.compile(
+            "(?i)\\b(?:from|join)\\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\\s+(?:as\\s+)?([a-zA-Z_][a-zA-Z0-9_]*))?");
+    private static final Pattern AS_ALIAS = Pattern.compile("(?i)\\bas\\s+([a-zA-Z_][a-zA-Z0-9_]*)");
+    private static final Pattern LIMIT = Pattern.compile("(?i)\\blimit\\s+(\\d+)");
+
+    /**
+     * 只读校验 + 表白名单 + 列白名单 + LIMIT 钳制。通过则返回最终可执行 SQL，否则抛 BizException。
+     * 说明：SELECT 子句里非表达式首位的标识符视为数字别名放行（如 COUNT(*) cnt），
+     * 因此「在 SELECT 首位直接引用白名单外列」会被拒，而合法别名不受误伤。
+     */
+    public static String validateSql(String sql, Set<String> allowedTables, Set<String> allowedColumns) {
+        if (sql == null || sql.isBlank()) {
+            throw new BizException("SQL 为空");
+        }
+        String cleaned = stripCommentsAndLiterals(sql);
+        if (cleaned.contains(";")) {
+            throw new BizException("不允许多语句（含分号）");
+        }
+        String[] toks = cleaned.trim().split("\\s+");
+        if (toks.length == 0 || !"SELECT".equalsIgnoreCase(toks[0])) {
+            throw new BizException("只允许 SELECT 查询");
+        }
+        for (String bad : FORBIDDEN) {
+            if (Pattern.compile("(?i)(?<![a-zA-Z0-9_])" + bad + "(?![a-zA-Z0-9_])").matcher(cleaned).find()) {
+                throw new BizException("SQL 含禁用关键字: " + bad);
+            }
+        }
+        Set<String> tables = lowerAll(allowedTables);
+        Set<String> columns = lowerAll(allowedColumns);
+
+        // 表校验 + 表别名收集
+        Set<String> aliases = new LinkedHashSet<>();
+        Matcher tm = FROM_JOIN.matcher(cleaned);
+        while (tm.find()) {
+            String table = tm.group(1).toLowerCase();
+            if (!tables.contains(table)) {
+                throw new BizException("表不在该数据源的映射白名单: " + table);
+            }
+            if (tm.group(2) != null && !KEYWORDS.contains(tm.group(2).toUpperCase())) {
+                aliases.add(tm.group(2).toLowerCase());
+            }
+        }
+        Matcher am = AS_ALIAS.matcher(cleaned);
+        while (am.find()) {
+            aliases.add(am.group(1).toLowerCase());
+        }
+        // SELECT 子句里的数字别名（非表达式首位的裸标识符，如 COUNT(*) cnt 的 cnt）
+        int firstFrom = indexOfWord(cleaned, "from");
+        String selectClause = firstFrom > 0 ? cleaned.substring(0, firstFrom) : cleaned;
+        boolean expectExpr = false;
+        Matcher sm = IDENT.matcher(selectClause);
+        while (sm.find()) {
+            String id = sm.group();
+            if (KEYWORDS.contains(id.toUpperCase())) {
+                expectExpr = Set.of("SELECT", "DISTINCT", "CASE", "WHEN", "THEN", "ELSE").contains(id.toUpperCase());
+                continue;
+            }
+            if (nextNonSpaceIs(selectClause, sm.end(), '(')) {
+                expectExpr = false; // 函数名
+                continue;
+            }
+            // 逗号/左括号后是新表达式的首位（如 SELECT a, b 的 b），不是别名
+            if (prevNonSpaceIs(selectClause, sm.start(), ',') || prevNonSpaceIs(selectClause, sm.start(), '(')) {
+                expectExpr = true;
+            }
+            // 点号两侧是 表别名.列 的引用，永远不是别名
+            if (prevNonSpaceIs(selectClause, sm.start(), '.') || nextNonSpaceIs(selectClause, sm.end(), '.')) {
+                expectExpr = true;
+            }
+            if (!expectExpr) {
+                aliases.add(id.toLowerCase());
+            }
+            expectExpr = false;
+        }
+
+        // 列校验：所有标识符必须落在 关键字/函数/别名/表白名单/列白名单 之内
+        Matcher im = IDENT.matcher(cleaned);
+        while (im.find()) {
+            String id = im.group();
+            String low = id.toLowerCase();
+            if (KEYWORDS.contains(id.toUpperCase()) || aliases.contains(low) || tables.contains(low)) {
+                continue;
+            }
+            if (nextNonSpaceIs(cleaned, im.end(), '(')) {
+                continue; // 函数调用
+            }
+            if (prevNonSpaceIs(cleaned, im.start(), '.')) {
+                if (!columns.contains(low)) {
+                    throw new BizException("列不在映射白名单: " + id);
+                }
+                continue;
+            }
+            if (nextNonSpaceIs(cleaned, im.end(), '.')) {
+                if (!tables.contains(low) && !aliases.contains(low)) {
+                    throw new BizException("限定词不在白名单: " + id);
+                }
+                continue;
+            }
+            if (!columns.contains(low)) {
+                throw new BizException("列不在映射白名单: " + id);
+            }
+        }
+
+        // LIMIT 钳制
+        String finalSql = sql.trim();
+        Matcher lm = LIMIT.matcher(finalSql);
+        if (lm.find()) {
+            int v = Integer.parseInt(lm.group(1));
+            if (v > 100) {
+                finalSql = finalSql.substring(0, lm.start()) + "LIMIT 100" + finalSql.substring(lm.end());
+            }
+        } else {
+            finalSql += " LIMIT 100";
+        }
+        return finalSql;
+    }
+
+    /** 去注释（--、#、块注释）与字符串字面量（''/"" 转义成对处理；反引号保留标识符内容） */
+    private static String stripCommentsAndLiterals(String sql) {
+        StringBuilder out = new StringBuilder();
+        int i = 0;
+        int n = sql.length();
+        while (i < n) {
+            char c = sql.charAt(i);
+            if (c == '-' && i + 1 < n && sql.charAt(i + 1) == '-') {
+                while (i < n && sql.charAt(i) != '\n') {
+                    i++;
+                }
+            } else if (c == '#') {
+                while (i < n && sql.charAt(i) != '\n') {
+                    i++;
+                }
+            } else if (c == '/' && i + 1 < n && sql.charAt(i + 1) == '*') {
+                i += 2;
+                while (i + 1 < n && !(sql.charAt(i) == '*' && sql.charAt(i + 1) == '/')) {
+                    i++;
+                }
+                i = Math.min(i + 2, n);
+            } else if (c == '\'' || c == '"') {
+                char q = c;
+                i++;
+                while (i < n) {
+                    if (sql.charAt(i) == '\\') {
+                        i += 2;
+                        continue;
+                    }
+                    if (sql.charAt(i) == q) {
+                        if (i + 1 < n && sql.charAt(i + 1) == q) {
+                            i += 2;
+                            continue;
+                        }
+                        i++;
+                        break;
+                    }
+                    i++;
+                }
+                out.append(' ');
+            } else if (c == '`') {
+                i++;
+                while (i < n && sql.charAt(i) != '`') {
+                    out.append(sql.charAt(i));
+                    i++;
+                }
+                i++;
+            } else {
+                out.append(c);
+                i++;
+            }
+        }
+        return out.toString();
+    }
+
+    private static int indexOfWord(String text, String word) {
+        Matcher m = Pattern.compile("(?i)(?<![a-zA-Z0-9_])" + word + "(?![a-zA-Z0-9_])").matcher(text);
+        return m.find() ? m.start() : -1;
+    }
+
+    private static boolean nextNonSpaceIs(String s, int from, char c) {
+        int i = from;
+        while (i < s.length() && Character.isWhitespace(s.charAt(i))) {
+            i++;
+        }
+        return i < s.length() && s.charAt(i) == c;
+    }
+
+    private static boolean prevNonSpaceIs(String s, int from, char c) {
+        int i = from - 1;
+        while (i >= 0 && Character.isWhitespace(s.charAt(i))) {
+            i--;
+        }
+        return i >= 0 && s.charAt(i) == c;
+    }
+
+    private static Set<String> lowerAll(Set<String> in) {
+        Set<String> out = new LinkedHashSet<>();
+        in.forEach(s -> out.add(s.toLowerCase()));
+        return out;
+    }
+
+    // ---------- 4. 执行与作答（LLM call 2） ----------
+
+    private Optional<String> composeAnswer(String q, Plan plan, String sql,
+                                           List<Map<String, Object>> view, int total) {
+        String rowsJson;
+        try {
+            rowsJson = objectMapper.writeValueAsString(view);
+        } catch (Exception e) {
+            rowsJson = "[]";
+        }
+        if (rowsJson.length() > 3000) {
+            rowsJson = rowsJson.substring(0, 3000) + "…";
+        }
+        return deepSeekClient.chat("CS_SEMANTIC_ANSWER",
+                "你是医院信息平台的数据问答助手。严格基于给定查询结果用中文回答，先给结论再给关键数字，"
+                        + "口语化，不超过200字。结果里没有的信息不要编造，结果为0条就如实说没有。",
+                "用户问题：" + q + "\n查询语义：" + plan.semantics() + "\n执行SQL：" + sql
+                        + "\n结果行数：" + total + (total > 20 ? "（仅展示前20行）" : "")
+                        + "\n结果JSON：" + rowsJson);
+    }
+
+    /** LLM 失败时的模板拼装（数字同样来自真实查询，绝不编造） */
+    private String templateAnswer(Plan plan, int total, List<Map<String, Object>> view) {
+        if (total == 0) {
+            return "按本体映射到 " + plan.ds() + " 查询，没有符合条件的记录。（" + plan.semantics() + "）";
+        }
+        return "按本体映射查询到 " + total + " 条记录（" + plan.semantics() + "）。首条明细：" + view.get(0);
+    }
+
+    /** 从实际用到的表反查映射概念，给 1-2 个本体页跳转链接 */
+    private List<Map<String, String>> conceptLinks(String ds, List<String> usedTables) {
+        if (usedTables.isEmpty()) {
+            return List.of();
+        }
+        List<Mapping> mappings = mappingMapper.selectList(new LambdaQueryWrapper<Mapping>()
+                .eq(Mapping::getDsCode, ds).in(Mapping::getTableName, usedTables));
+        List<String> codes = mappings.stream().map(Mapping::getConceptCode).distinct().limit(2).toList();
+        List<Map<String, String>> links = new ArrayList<>();
+        for (String code : codes) {
+            links.add(Map.of("label", "去本体页看概念 " + code, "route", "/ontology?concept=" + code));
+        }
+        return links;
+    }
+
+    /** 模型作答无表可用时，从文本里识别提及的概念（code 或中文名）给跳转链接 */
+    private List<Map<String, String>> conceptLinksFromText(String text) {
+        if (text == null) {
+            return List.of();
+        }
+        List<Concept> concepts = conceptMapper.selectList(
+                new LambdaQueryWrapper<Concept>().eq(Concept::getStatus, "PUBLISHED"));
+        List<Map<String, String>> links = new ArrayList<>();
+        for (Concept c : concepts) {
+            if (text.contains(c.getCode()) || (c.getName() != null && text.contains(c.getName()))) {
+                links.add(Map.of("label", "去本体页看概念 " + c.getCode(),
+                        "route", "/ontology?concept=" + c.getCode()));
+                if (links.size() >= 2) {
+                    break;
+                }
+            }
+        }
+        return links;
+    }
+
+    private Set<String> allowedTables(String ds) {
+        return new LinkedHashSet<>(mappingMapper.selectList(new LambdaQueryWrapper<Mapping>()
+                        .eq(Mapping::getDsCode, ds).eq(Mapping::getConfirmed, 1))
+                .stream().map(Mapping::getTableName).toList());
+    }
+
+    private Set<String> allowedColumns(String ds) {
+        return new LinkedHashSet<>(mappingMapper.selectList(new LambdaQueryWrapper<Mapping>()
+                        .eq(Mapping::getDsCode, ds).eq(Mapping::getConfirmed, 1))
+                .stream().map(Mapping::getColumnName).toList());
+    }
+}
