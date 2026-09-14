@@ -109,6 +109,58 @@
             <span class="metric-header-title">指标库</span>
             <el-button type="primary" :loading="inspecting" @click="inspectAll">全量巡检</el-button>
           </div>
+
+          <!-- 指标统计头（全部来自真实台账与巡检结果） -->
+          <div class="metric-stats">
+            <div class="mstat">
+              <div class="mstat-value">{{ metricStats.total }}</div>
+              <div class="mstat-label">已定义指标</div>
+            </div>
+            <div class="mstat">
+              <div class="mstat-value" style="color: var(--el-color-success)">
+                {{ metricStats.monitored }}
+              </div>
+              <div class="mstat-label">已接入巡检</div>
+            </div>
+            <div class="mstat">
+              <div class="mstat-value" :class="{ 'mstat-warn': metricStats.alarmed }">
+                {{ metricStats.alarmed }}
+              </div>
+              <div class="mstat-label">巡检告警中</div>
+            </div>
+            <div class="mstat">
+              <div class="mstat-value" style="color: #8b5cf6">{{ metricStats.newThisMonth }}</div>
+              <div class="mstat-label">本月新增</div>
+            </div>
+          </div>
+
+          <!-- 筛选工具栏 -->
+          <div class="metric-toolbar">
+            <el-input
+              v-model="metricKw"
+              placeholder="搜索指标名称 / 编码"
+              clearable
+              :prefix-icon="Search"
+              style="width: 220px"
+            />
+            <el-select v-model="metricDomain" placeholder="所有业务域" clearable style="width: 160px">
+              <el-option v-for="d in metricDomains" :key="d" :label="d" :value="d" />
+            </el-select>
+            <el-select
+              v-model="metricStatus"
+              placeholder="所有监控状态"
+              clearable
+              style="width: 150px"
+            >
+              <el-option label="告警中" value="alarm" />
+              <el-option label="正常" value="ok" />
+              <el-option label="未接入监控" value="none" />
+            </el-select>
+            <span class="metric-toolbar-tip">
+              {{ filteredMetrics.length }} / {{ metrics.length }} 项 · 状态来自巡检实测，非人工标注
+            </span>
+          </div>
+
           <el-alert
             v-if="inspected && alarmedMetrics.length"
             type="error"
@@ -118,10 +170,18 @@
           />
           <el-row :gutter="16" v-loading="loadingMetrics">
             <el-col v-for="m in pagedMetrics" :key="m.id" :span="8">
-              <el-card class="metric-card" shadow="hover">
+              <el-card
+                :id="`metric-${m.metricCode}`"
+                class="metric-card"
+                :class="{ 'metric-highlight': m.metricCode === highlightCode }"
+                shadow="hover"
+              >
                 <div class="metric-name">
                   {{ m.name }}
                   <span class="metric-code">{{ m.metricCode }}</span>
+                  <el-tag v-if="metricDomainOf(m)" size="small" effect="plain" style="margin-left: 6px">
+                    {{ metricDomainOf(m) }}
+                  </el-tag>
                   <el-tag
                     v-if="!hasProbe(m)"
                     size="small"
@@ -165,13 +225,13 @@
             </el-col>
           </el-row>
           <el-pagination
-            v-if="metrics.length > metricPageSize"
+            v-if="filteredMetrics.length > metricPageSize"
             class="metric-pager"
             small
             layout="total, prev, pager, next"
             v-model:current-page="metricPage"
             :page-size="metricPageSize"
-            :total="metrics.length"
+            :total="filteredMetrics.length"
           />
         </el-tab-pane>
       </el-tabs>
@@ -212,8 +272,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, watch, nextTick } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage, ElMessageBox, ElLoading } from 'element-plus'
+import { Search } from '@element-plus/icons-vue'
 import {
   listTerms,
   createTerm,
@@ -226,6 +288,7 @@ import {
 import { useConceptStore } from '../../store/concept'
 
 const conceptStore = useConceptStore()
+const route = useRoute()
 
 // ---------- 语义搜索 ----------
 const q = ref('')
@@ -339,10 +402,64 @@ const metrics = ref([])
 const loadingMetrics = ref(false)
 const metricPage = ref(1)
 const metricPageSize = 12
+const highlightCode = ref('') // 深链定位的指标（口径卡「去统一口径页」跳入时高亮）
+
+// 筛选：关键字 / 业务域（来自绑定概念）/ 监控状态（来自巡检实测）
+const metricKw = ref('')
+const metricDomain = ref('')
+const metricStatus = ref('')
+
+// 指标 → 绑定概念 → 业务域；概念未加载或未绑定时返回空
+const metricDomainOf = (m) => {
+  const c = conceptStore.concepts.find((x) => x.code === m.conceptCode)
+  return c?.domainCode || ''
+}
+
+const metricDomains = computed(() => {
+  const set = new Set(metrics.value.map(metricDomainOf).filter(Boolean))
+  return [...set]
+})
+
+const metricStats = computed(() => {
+  const monthPrefix = new Date().toISOString().slice(0, 7)
+  return {
+    total: metrics.value.length,
+    monitored: metrics.value.filter(hasProbe).length,
+    alarmed: metrics.value.filter((m) => displayAlarm(m)).length,
+    newThisMonth: metrics.value.filter(
+      (m) => (m.createdAt || '').startsWith(monthPrefix)
+    ).length
+  }
+})
+
+const filteredMetrics = computed(() => {
+  let list = metrics.value
+  const kw = metricKw.value.trim().toLowerCase()
+  if (kw) {
+    list = list.filter(
+      (m) => m.name?.toLowerCase().includes(kw) || m.metricCode?.toLowerCase().includes(kw)
+    )
+  }
+  if (metricDomain.value) {
+    list = list.filter((m) => metricDomainOf(m) === metricDomain.value)
+  }
+  if (metricStatus.value === 'alarm') {
+    list = list.filter((m) => displayAlarm(m))
+  } else if (metricStatus.value === 'ok') {
+    list = list.filter((m) => hasProbe(m) && !displayAlarm(m))
+  } else if (metricStatus.value === 'none') {
+    list = list.filter((m) => !hasProbe(m))
+  }
+  return list
+})
 
 const pagedMetrics = computed(() => {
   const start = (metricPage.value - 1) * metricPageSize
-  return metrics.value.slice(start, start + metricPageSize)
+  return filteredMetrics.value.slice(start, start + metricPageSize)
+})
+
+watch([metricKw, metricDomain, metricStatus], () => {
+  metricPage.value = 1
 })
 
 const loadMetrics = async () => {
@@ -424,10 +541,39 @@ const runEvaluate = async (m) => {
   }
 }
 
-onMounted(() => {
+// 承接问数页口径卡深链（/glossary?metric=XXX）：切到指标库、清筛选、翻页并高亮定位；
+// 找不到时如实告知，不静默失败
+const locateMetric = (code) => {
+  if (!metrics.value.length) {
+    ElMessage.info('指标列表未加载，无法定位指标')
+    return
+  }
+  if (!metrics.value.some((m) => m.metricCode === code)) {
+    ElMessage.info(`未在指标库找到指标 ${code}，可能已被删除`)
+    return
+  }
+  highlightCode.value = code
+  tab.value = 'metrics'
+  metricKw.value = ''
+  metricDomain.value = ''
+  metricStatus.value = ''
+  const idx = filteredMetrics.value.findIndex((m) => m.metricCode === code)
+  if (idx >= 0) metricPage.value = Math.floor(idx / metricPageSize) + 1
+  nextTick(() => {
+    document.getElementById(`metric-${code}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
+}
+
+onMounted(async () => {
   conceptStore.fetchAll()
   loadTerms()
-  loadMetrics()
+  try {
+    await loadMetrics()
+  } catch (e) {
+    // 列表加载失败保持页面空态；深链定位会提示「未加载」
+  }
+  const code = route.query.metric
+  if (code) locateMetric(String(code))
 })
 </script>
 
@@ -465,6 +611,11 @@ onMounted(() => {
 
 .metric-card {
   margin-bottom: 16px;
+}
+
+.metric-card.metric-highlight {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-light, rgba(45, 138, 126, 0.25));
 }
 
 .metric-name {
@@ -554,5 +705,44 @@ onMounted(() => {
 .metric-threshold {
   margin-left: 8px;
   color: #e6a23c;
+}
+
+/* ---------- 指标统计头与筛选工具栏 ---------- */
+.metric-stats {
+  display: flex;
+  gap: 40px;
+  padding: 14px 18px;
+  margin-bottom: 12px;
+  background: var(--el-bg-color-page, #f7f8fa);
+  border-radius: 8px;
+}
+
+.mstat-value {
+  font-size: 24px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.mstat-value.mstat-warn {
+  color: var(--el-color-danger);
+}
+
+.mstat-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.metric-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.metric-toolbar-tip {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 </style>

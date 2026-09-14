@@ -16,10 +16,16 @@ import com.bemodel.ontology.mapper.RelationMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
 import java.util.stream.Collectors;
 
 /**
@@ -39,6 +45,10 @@ public class ImpactService {
     private final DeepSeekClient deepSeekClient;
 
     public Map<String, Object> analyze(String conceptCode, String changeDesc) {
+        return analyze(conceptCode, changeDesc, null);
+    }
+
+    public Map<String, Object> analyze(String conceptCode, String changeDesc, Integer depth) {
         Concept concept = conceptMapper.selectOne(
                 new LambdaQueryWrapper<Concept>().eq(Concept::getCode, conceptCode));
         if (concept == null) {
@@ -62,16 +72,51 @@ public class ImpactService {
         List<LinkNode> testcases = linkNodeMapper.selectList(new LambdaQueryWrapper<LinkNode>()
                 .eq(LinkNode::getConceptCode, conceptCode).eq(LinkNode::getNodeType, "TESTCASE"));
 
-        // 上下游概念（本体图一度邻居）
-        List<Relation> relations = relationMapper.selectList(
-                new LambdaQueryWrapper<Relation>()
-                        .eq(Relation::getFromConcept, conceptCode)
-                        .or().eq(Relation::getToConcept, conceptCode));
-        List<String> relatedConcepts = relations.stream()
-                .map(r -> r.getFromConcept().equals(conceptCode)
-                        ? r.getFromConcept() + " —" + r.getRelationName() + "→ " + r.getToConcept() + "（下游受影响）"
-                        : r.getFromConcept() + " —" + r.getRelationName() + "→ " + r.getToConcept() + "（上游来源）")
-                .toList();
+        // 上下游概念：本体图双向 BFS 多跳影响面（默认 3 跳，上限 6；截断显式 capped）
+        int maxDepth = depth == null || depth < 1 ? 3 : Math.min(depth, 6);
+        List<Relation> allRelations = relationMapper.selectList(null);
+        Map<String, Integer> hopOf = new LinkedHashMap<>();
+        hopOf.put(conceptCode, 0);
+        List<String> relatedConcepts = new ArrayList<>();
+        Set<Long> seenEdges = new HashSet<>();
+        Deque<String> queue = new ArrayDeque<>();
+        queue.add(conceptCode);
+        boolean capped = false;
+        while (!queue.isEmpty()) {
+            String cur = queue.poll();
+            int hop = hopOf.get(cur);
+            for (Relation r : allRelations) {
+                boolean isOut = r.getFromConcept().equals(cur);
+                boolean isIn = r.getToConcept().equals(cur);
+                if (!isOut && !isIn) {
+                    continue;
+                }
+                String next = isOut ? r.getToConcept() : r.getFromConcept();
+                if (next.equals(conceptCode)) {
+                    continue;
+                }
+                if (hop >= maxDepth) {
+                    capped = true; // 到上限仍有未展开的邻居 → 显式截断标记
+                    continue;
+                }
+                if (seenEdges.add(r.getId())) {
+                    relatedConcepts.add(String.format("%s —%s→ %s（%s · %d跳）",
+                            r.getFromConcept(), r.getRelationName(), r.getToConcept(),
+                            isOut ? "下游受影响" : "上游来源", hop + 1));
+                }
+                if (!hopOf.containsKey(next)) {
+                    hopOf.put(next, hop + 1);
+                    queue.add(next);
+                }
+            }
+        }
+        // 按跳数分层（前端直接可展示）
+        Map<Integer, List<String>> impactLayers = new TreeMap<>();
+        hopOf.forEach((code, hop) -> {
+            if (hop > 0) {
+                impactLayers.computeIfAbsent(hop, k -> new ArrayList<>()).add(code);
+            }
+        });
 
         // 历史变更/工单（同类变更的历史教训）
         List<LinkNode> history = linkNodeMapper.selectList(new LambdaQueryWrapper<LinkNode>()
@@ -88,7 +133,7 @@ public class ImpactService {
                 .append(String.join("、", cols)).append('\n'));
         ctx.append("关联指标：").append(metrics.stream().map(Metric::getName).toList()).append('\n');
         ctx.append("已有测试用例：").append(testcases.stream().map(LinkNode::getTitle).toList()).append('\n');
-        ctx.append("上下游概念：").append(relatedConcepts).append('\n');
+        ctx.append("上下游概念（多跳影响面，最多" + maxDepth + "跳）：").append(relatedConcepts).append('\n');
         ctx.append("同类历史变更与工单：")
                 .append(history.stream().map(h -> h.getRefNo() + " " + h.getTitle()).toList()).append('\n');
 
@@ -118,6 +163,9 @@ public class ImpactService {
         result.put("coveredTestcases", testcases.stream().map(t -> Map.of(
                 "refNo", t.getRefNo(), "title", t.getTitle(), "status", t.getStatus())).toList());
         result.put("relatedConcepts", relatedConcepts);
+        result.put("impactLayers", impactLayers);
+        result.put("impactDepth", maxDepth);
+        result.put("impactCapped", capped);
         result.put("history", history.stream().map(h -> Map.of(
                 "refNo", h.getRefNo(), "title", h.getTitle(), "type", h.getNodeType())).toList());
         result.put("advice", advice);

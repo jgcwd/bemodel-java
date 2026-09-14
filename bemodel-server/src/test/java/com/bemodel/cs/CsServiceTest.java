@@ -35,6 +35,8 @@ class CsServiceTest {
     private RcaCaseMapper caseMapper;
     @Autowired
     private DatasourceService datasourceService;
+    @Autowired
+    private com.bemodel.cs.mapper.CsFeedbackMapper csFeedbackMapper;
 
     private LinkNode ticket;
 
@@ -114,6 +116,79 @@ class CsServiceTest {
         Map<String, Object> r = csService.ask("今天天气怎么样");
 
         assertEquals("能力引导", r.get("intent"), "词表外问题应落到能力菜单而非编造答案");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void askShouldForkRoutingByScene() {
+        // 同一句话两个场景走不同分支：客服场景命中专属核对处理器，问数场景进语义层
+        Map<String, Object> cs = csService.ask("没缴费可以发药吗？", CsService.SCENE_CS);
+        assertEquals("缴费发药双向核对", cs.get("intent"), "客服场景应走专属核对处理器");
+
+        Map<String, Object> qa = csService.ask("没缴费可以发药吗？", CsService.SCENE_ANALYTICS);
+        assertNotEquals("缴费发药双向核对", qa.get("intent"), "问数场景不应落入客服专属处理器");
+        // 无 Key 时语义层不可用：应降级为问数兜底菜单（场景引导），而非客服菜单
+        assertEquals("场景引导", qa.get("intent"), "问数场景应落问数兜底菜单");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void fallbackMenusShouldCrossReferEachScene() {
+        Map<String, Object> csMenu = csService.ask("今天天气怎么样");
+        assertEquals("REFERRAL", csMenu.get("router"), "未命中应显式标记 REFERRAL 而非靠字符串嗅探");
+        assertTrue(String.valueOf(csMenu.get("links")).contains("/ask"), "客服兜底菜单应转介智能问数");
+
+        Map<String, Object> qaMenu = csService.ask("今天天气怎么样", CsService.SCENE_ANALYTICS);
+        assertEquals("REFERRAL", qaMenu.get("router"));
+        assertTrue(String.valueOf(qaMenu.get("links")).contains("/cs"), "问数兜底菜单应转介 AI 客服");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void glossaryMetricHitShouldCarryMetricCard() {
+        // 口径卡：指标命中时附带结构化字段（定义/公式/探针SQL 均取自 bm_metric 真实数据，卡上 SQL 与巡检同源）
+        Map<String, Object> r = csService.ask("出院人数怎么算？", CsService.SCENE_ANALYTICS);
+
+        assertEquals("口径查询", r.get("intent"));
+        assertEquals("METRIC", r.get("card"), "指标命中应显式标记口径卡，前端不做字符串嗅探");
+        Map<String, Object> card = (Map<String, Object>) r.get("metric");
+        assertEquals("DISCHARGE_COUNT", card.get("metricCode"), "口径问题应优先命中指标（出院人数）");
+        assertNotNull(card.get("definition"), "口径定义应来自指标库");
+        assertTrue(card.get("probeSql") != null && String.valueOf(card.get("probeSql")).contains("COUNT"),
+                "探针SQL应来自指标库真实配置");
+        assertEquals(Boolean.TRUE, card.get("hasProbe"), "数据源+探针齐备的指标应显式带 hasProbe 标记（文案按真实能力分支）");
+        List<Map<String, Object>> links = (List<Map<String, Object>>) r.get("links");
+        assertTrue(String.valueOf(links.get(0).get("route")).startsWith("/glossary?metric="),
+                "口径卡应带统一口径页指标深链");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void glossaryCardShouldStayAnalyticsOnly() {
+        // CS 场景保持历史文本形态：同一问题不出口径卡、链接为通用 /glossary（卡片仅问数场景前置路径产出）
+        Map<String, Object> cs = csService.ask("出院人数怎么算？", CsService.SCENE_CS);
+        assertEquals("口径查询", cs.get("intent"));
+        assertNull(cs.get("card"), "客服场景不应附带口径卡字段");
+        List<Map<String, Object>> links = (List<Map<String, Object>>) cs.get("links");
+        assertEquals("/glossary", links.get(0).get("route"), "客服场景应保持通用术语页链接");
+
+        // 问数场景下，仅术语文本命中（名称不直命中）也应走文本回答：什么是检验申请 不该卡到检验撤销率
+        Map<String, Object> qa = csService.ask("什么是检验申请？", CsService.SCENE_ANALYTICS);
+        assertNull(qa.get("card"), "仅定义顺带命中时不应出口径卡");
+    }
+
+    @Test
+    void routePromptShouldCarryMistakeFeedback() {
+        // 反馈回路：correct=0 的错例应出现在路由提示词尾部（LLM 看到前车之鉴）
+        CsFeedback f = csService.saveFeedback("测试错例问题XYZ", "MATERIAL", "LLM", 0, "正确应为 OTHER");
+        try {
+            String prompt = csService.routePrompt("任意问题");
+            assertTrue(prompt.contains("测试错例问题XYZ"), "错例原文应进提示词");
+            assertTrue(prompt.contains("前车之鉴"), "应有错例段落引导语");
+            assertTrue(prompt.contains("正确应为 OTHER"), "备注（正确意图）应进提示词");
+        } finally {
+            csFeedbackMapper.deleteById(f.getId());
+        }
     }
 
     @Test

@@ -20,7 +20,7 @@ public class OntologyMiss {
     private String term;
     /** CONCEPT/ATTRIBUTE */
     private String kind;
-    /** SEARCH/MAPPING_AI */
+    /** SEARCH/MAPPING_AI/CS_ASK/QA_ASK */
     private String source;
     /** 累计出现次数 */
     private Integer count;

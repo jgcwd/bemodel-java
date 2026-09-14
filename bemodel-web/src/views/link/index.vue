@@ -22,11 +22,19 @@
             :value="c.code"
           />
         </el-select>
-        <el-button type="primary" plain @click="openCreate">新增节点</el-button>
+        <el-tooltip content="只读角色无写权限" :disabled="!userStore.isViewer" placement="top">
+          <span>
+            <el-button type="primary" plain :disabled="userStore.isViewer" @click="openCreate">新增节点</el-button>
+          </span>
+        </el-tooltip>
         <el-button type="warning" @click="openImpact">变更影响评估</el-button>
-        <el-button type="danger" plain :loading="autoTicketing" @click="runAutoTicket">
-          异常检测转工单
-        </el-button>
+        <el-tooltip content="只读角色无写权限" :disabled="!userStore.isViewer" placement="top">
+          <span>
+            <el-button type="danger" plain :disabled="userStore.isViewer" :loading="autoTicketing" @click="runAutoTicket">
+              异常检测转工单
+            </el-button>
+          </span>
+        </el-tooltip>
       </div>
       <el-table :data="nodes" v-loading="loading" highlight-current-row @row-click="openDetail">
         <el-table-column label="类型" width="110">
@@ -382,6 +390,10 @@
             />
           </el-select>
         </el-form-item>
+        <el-form-item label="影响深度">
+          <el-input-number v-model="impactForm.depth" :min="1" :max="6" />
+          <span class="depth-tip">沿概念关系向外扩散的跳数（1-6）</span>
+        </el-form-item>
         <el-form-item label="变更描述" required>
           <el-input
             v-model="impactForm.changeDesc"
@@ -396,11 +408,20 @@
       </el-form>
 
       <template v-if="impactResult">
+        <el-alert
+          v-if="impactResult.impactCapped"
+          type="warning"
+          :closable="false"
+          show-icon
+          title="影响面较大，结果已截断"
+          style="margin-bottom: 12px"
+        />
         <el-descriptions :column="1" border>
           <el-descriptions-item label="概念">
             {{ impactResult.conceptName }}（{{ impactResult.conceptCode }}）
           </el-descriptions-item>
           <el-descriptions-item label="变更描述">{{ impactResult.changeDesc }}</el-descriptions-item>
+          <el-descriptions-item label="影响深度">{{ impactResult.impactDepth ?? impactForm.depth }} 跳</el-descriptions-item>
         </el-descriptions>
 
         <el-divider content-position="left">受影响产品库映射</el-divider>
@@ -452,8 +473,20 @@
           title="当前无测试用例覆盖该概念，必须补充"
         />
 
-        <el-divider content-position="left">上下游概念</el-divider>
-        <div v-if="impactResult.relatedConcepts?.length" class="impact-list">
+        <el-divider content-position="left">上下游概念（按跳分层）</el-divider>
+        <div v-if="impactLayerKeys.length" class="impact-list">
+          <div v-for="depth in impactLayerKeys" :key="depth" class="impact-layer-row">
+            <span class="impact-layer-depth">第 {{ depth }} 跳</span>
+            <el-tag
+              v-for="c in impactResult.impactLayers[depth]"
+              :key="c"
+              size="small"
+              effect="plain"
+              class="impact-layer-tag"
+            >{{ c }}</el-tag>
+          </div>
+        </div>
+        <div v-else-if="impactResult.relatedConcepts?.length" class="impact-list">
           <div v-for="(rc, i) in impactResult.relatedConcepts" :key="i" class="impact-list-row">
             {{ rc }}
           </div>
@@ -493,9 +526,11 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElLoading, ElMessageBox } from 'element-plus'
 import { listLinks, linkChain, linkChainRels, createLink, analyzeImpact, autoTicket, traceLink, createRel, deleteRel } from '../../api/link'
 import { useConceptStore } from '../../store/concept'
+import { useUserStore } from '../../store/user'
 
 const router = useRouter()
 const conceptStore = useConceptStore()
+const userStore = useUserStore()
 
 // ---------- 类型字典 ----------
 const nodeTypeMap = {
@@ -904,11 +939,19 @@ const submitCreate = async () => {
 const impactVisible = ref(false)
 const analyzing = ref(false)
 const impactResult = ref(null)
-const impactForm = reactive({ conceptCode: '', changeDesc: '' })
+const impactForm = reactive({ conceptCode: '', changeDesc: '', depth: 3 })
+
+// 按跳分层展示的层序号（升序）
+const impactLayerKeys = computed(() =>
+  Object.keys(impactResult.value?.impactLayers || {})
+    .map(Number)
+    .sort((a, b) => a - b)
+)
 
 const openImpact = () => {
   impactForm.conceptCode = filterConcept.value || ''
   impactForm.changeDesc = ''
+  impactForm.depth = 3
   impactResult.value = null
   impactVisible.value = true
 }
@@ -926,7 +969,8 @@ const runImpact = async () => {
   try {
     impactResult.value = await analyzeImpact({
       conceptCode: impactForm.conceptCode,
-      changeDesc: impactForm.changeDesc.trim()
+      changeDesc: impactForm.changeDesc.trim(),
+      depth: String(impactForm.depth)
     })
     ElMessage.success('影响评估完成')
   } finally {
@@ -1160,6 +1204,31 @@ onMounted(() => {
 .impact-none {
   color: #c0c4cc;
   font-size: 13px;
+}
+
+.depth-tip {
+  margin-left: 12px;
+  font-size: 12px;
+  color: #909399;
+}
+
+.impact-layer-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 0;
+}
+
+.impact-layer-depth {
+  font-size: 12px;
+  color: #909399;
+  width: 60px;
+  flex-shrink: 0;
+}
+
+.impact-layer-tag {
+  margin-right: 4px;
 }
 
 .impact-advice-card {

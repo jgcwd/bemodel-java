@@ -2,9 +2,11 @@ package com.bemodel.ontology.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.bemodel.ontology.entity.Concept;
+import com.bemodel.ontology.entity.ConceptParent;
 import com.bemodel.ontology.entity.Disjoint;
 import com.bemodel.ontology.entity.Relation;
 import com.bemodel.ontology.mapper.ConceptMapper;
+import com.bemodel.ontology.mapper.ConceptParentMapper;
 import com.bemodel.ontology.mapper.DisjointMapper;
 import com.bemodel.ontology.mapper.RelationMapper;
 import lombok.RequiredArgsConstructor;
@@ -13,9 +15,11 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 /**
@@ -29,6 +33,7 @@ public class OntologyCheckService {
     private final RelationMapper relationMapper;
     private final ConceptMapper conceptMapper;
     private final DisjointMapper disjointMapper;
+    private final ConceptParentMapper conceptParentMapper;
 
     public record Defect(String type, String severity, String message, List<String> refs) {
     }
@@ -38,10 +43,12 @@ public class OntologyCheckService {
         List<Relation> relations = relationMapper.selectList(null);
         List<Concept> concepts = conceptMapper.selectList(null);
         List<Disjoint> disjoints = disjointMapper.selectList(null);
+        List<ConceptParent> parents = conceptParentMapper.selectList(null);
 
         checkRelationAxioms(relations, defects);
         checkDisjoint(disjoints, concepts, defects);
         checkIriDuplicate(concepts, defects);
+        checkSubClassCycle(parents, defects);
 
         defects.sort(Comparator.comparing(Defect::type)
                 .thenComparing(d -> String.join(",", d.refs())));
@@ -124,6 +131,62 @@ public class OntologyCheckService {
                         "互斥行引用了不存在的概念: " + String.join("、", missing), pair));
             }
         }
+    }
+
+    // ---------- IRI ----------
+
+    // ---------- 继承环 ----------
+
+    /**
+     * SUBCLASS_CYCLE（BLOCKER）：bm_concept_parent 全图找环。
+     * 三色 DFS；环规范化（从最小 code 起报告）+ 去重，保证同一数据多次检查结果一致。
+     */
+    private void checkSubClassCycle(List<ConceptParent> parents, List<Defect> defects) {
+        Map<String, List<String>> childToParents = new LinkedHashMap<>();
+        Set<String> nodes = new TreeSet<>();
+        for (ConceptParent p : parents) {
+            childToParents.computeIfAbsent(p.getChildCode(), k -> new ArrayList<>()).add(p.getParentCode());
+            nodes.add(p.getChildCode());
+            nodes.add(p.getParentCode());
+        }
+        Set<String> cycles = new TreeSet<>();
+        Map<String, Integer> color = new LinkedHashMap<>(); // 0=未访问 1=在栈 2=完成
+        for (String start : nodes) {
+            if (color.getOrDefault(start, 0) == 0) {
+                dfsCycle(start, childToParents, color, new ArrayList<>(), cycles);
+            }
+        }
+        for (String cycle : cycles) {
+            defects.add(new Defect("SUBCLASS_CYCLE", "BLOCKER",
+                    "概念继承存在环: " + cycle, List.of(cycle.split("→"))));
+        }
+    }
+
+    private void dfsCycle(String node, Map<String, List<String>> childToParents,
+                          Map<String, Integer> color, List<String> stack, Set<String> cycles) {
+        color.put(node, 1);
+        stack.add(node);
+        for (String parent : childToParents.getOrDefault(node, List.of())) {
+            int c = color.getOrDefault(parent, 0);
+            if (c == 1) {
+                // 命中栈上节点 → 截取环段并规范化（从最小 code 起报告）
+                List<String> ring = new ArrayList<>(stack.subList(stack.indexOf(parent), stack.size()));
+                int minIdx = 0;
+                for (int i = 1; i < ring.size(); i++) {
+                    if (ring.get(i).compareTo(ring.get(minIdx)) < 0) {
+                        minIdx = i;
+                    }
+                }
+                List<String> rotated = new ArrayList<>(ring.subList(minIdx, ring.size()));
+                rotated.addAll(ring.subList(0, minIdx));
+                rotated.add(ring.get(minIdx));
+                cycles.add(String.join("→", rotated));
+            } else if (c == 0) {
+                dfsCycle(parent, childToParents, color, stack, cycles);
+            }
+        }
+        stack.remove(stack.size() - 1);
+        color.put(node, 2);
     }
 
     // ---------- IRI ----------

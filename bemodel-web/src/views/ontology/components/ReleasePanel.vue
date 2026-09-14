@@ -11,7 +11,10 @@
               {{ currentVersion || '-' }}
             </div>
           </div>
-          <el-button type="primary" :loading="checking" @click="openPublish">发布新版本</el-button>
+          <div style="display: flex; gap: 8px">
+            <el-button :disabled="releases.length < 2" @click="openDiff">变更图谱</el-button>
+            <el-button type="primary" :loading="checking" @click="openPublish">发布新版本</el-button>
+          </div>
         </div>
         <el-table :data="releases" v-loading="loadingReleases" style="margin-top: 16px" size="small">
           <el-table-column label="版本号" width="90">
@@ -171,6 +174,108 @@
     </template>
   </el-dialog>
 
+  <!-- 变更图谱：相邻版本快照 diff -->
+  <el-dialog v-model="diffVisible" title="本体变更图谱" width="1100px" top="4vh">
+    <div v-loading="loadingDiff">
+      <!-- 版本演化时间线 -->
+      <div class="diff-timeline">
+        <div class="diff-timeline-title">版本演化</div>
+        <div class="diff-timeline-track">
+          <template v-for="(r, i) in releasesDesc" :key="r.id">
+            <div
+              class="tl-node"
+              :class="{ sel: diffB?.id === r.id, base: diffA?.id === r.id }"
+              :title="`基线 ${r.versionTag}`"
+              @click="pickTimeline(r)"
+            >
+              <div class="tl-dot"></div>
+              <div class="tl-tag">{{ r.versionTag }}</div>
+              <div class="tl-date">{{ (r.createdAt || '').slice(0, 10) }}</div>
+            </div>
+            <div v-if="i < releasesDesc.length - 1" class="tl-line"></div>
+          </template>
+        </div>
+      </div>
+
+      <!-- A/B 选择 -->
+      <div class="diff-pickers">
+        <el-select v-model="diffAId" style="width: 200px" @change="loadDiff">
+          <el-option v-for="r in releasesDesc" :key="r.id" :label="`基线：${r.versionTag}`" :value="r.id" />
+        </el-select>
+        <span class="diff-arrow">→</span>
+        <el-select v-model="diffBId" style="width: 200px" @change="loadDiff">
+          <el-option v-for="r in releasesDesc" :key="r.id" :label="`对比：${r.versionTag}`" :value="r.id" />
+        </el-select>
+        <span v-if="diffSummary" class="diff-summary">
+          {{ diffSummary.releasedAt }} · {{ diffSummary.total }} 处变更
+        </span>
+      </div>
+
+      <el-row :gutter="16" v-if="diffSummary">
+        <!-- 左：变更清单 -->
+        <el-col :span="12">
+          <div class="diff-card">
+            <div class="diff-card-title">{{ diffA?.versionTag }} → {{ diffB?.versionTag }} 变更内容</div>
+            <template v-for="g in diffGroups" :key="g.type">
+              <div class="dg-head">
+                <span class="dg-name">{{ g.label }}</span>
+                <span class="dg-counts">
+                  <em v-if="g.added.length" class="c-add">+{{ g.added.length }}</em>
+                  <em v-if="g.removed.length" class="c-del">-{{ g.removed.length }}</em>
+                  <em v-if="g.changed.length" class="c-chg">±{{ g.changed.length }}</em>
+                </span>
+              </div>
+              <div v-for="e in g.added" :key="'a' + g.type + e.key" class="dg-item">
+                <el-tag size="small" type="success" effect="dark" class="dg-op">新增</el-tag>
+                <b>{{ e.id }}</b>
+                <span v-if="e.name" class="dg-name2">{{ e.name }}</span>
+              </div>
+              <div v-for="e in g.removed" :key="'r' + g.type + e.key" class="dg-item">
+                <el-tag size="small" type="danger" effect="dark" class="dg-op">移除</el-tag>
+                <b>{{ e.id }}</b>
+                <span v-if="e.name" class="dg-name2">{{ e.name }}</span>
+              </div>
+              <div v-for="e in g.changed" :key="'c' + g.type + e.key" class="dg-item">
+                <el-tag size="small" type="warning" effect="dark" class="dg-op">修改</el-tag>
+                <b>{{ e.id }}</b>
+                <span class="dg-fields">
+                  <template v-for="(fv, f) in e.changes" :key="f">
+                    <span class="dg-field">{{ fieldText(f) }}：<s>{{ fv[0] ?? '空' }}</s> → {{ fv[1] ?? '空' }}</span>
+                  </template>
+                </span>
+              </div>
+            </template>
+            <el-empty
+              v-if="!diffGroups.length"
+              description="两个版本结构完全一致"
+              :image-size="60"
+            />
+          </div>
+        </el-col>
+
+        <!-- 右：影响面 + OWL Diff -->
+        <el-col :span="12">
+          <div class="diff-card">
+            <div class="diff-card-title">影响面分析（按变更元素类型实测统计）</div>
+            <div class="impact-grid">
+              <div v-for="g in diffGroups" :key="'i' + g.type" class="impact-box">
+                <div class="impact-num">{{ g.added.length + g.removed.length + g.changed.length }}</div>
+                <div class="impact-label">{{ g.label }}</div>
+              </div>
+              <div v-if="!diffGroups.length" class="impact-none">无结构变更</div>
+            </div>
+          </div>
+          <div class="diff-card">
+            <div class="diff-card-title">OWL Diff（节选，由快照 diff 生成）</div>
+            <pre class="owl-diff"><template v-for="(line, i) in owlLines" :key="i"><span
+  :class="{ 'owl-add': line.startsWith('+'), 'owl-del': line.startsWith('-') }">{{ line }}
+</span></template></pre>
+          </div>
+        </el-col>
+      </el-row>
+    </div>
+  </el-dialog>
+
   <!-- 版本快照 -->
   <el-dialog v-model="snapshotVisible" :title="`版本快照：${snapshotRelease?.versionTag || ''}`" width="640px">
     <div v-loading="loadingSnapshot">
@@ -328,6 +433,144 @@ const openSnapshot = async (row) => {
   }
 }
 
+// ---------- 变更图谱：相邻版本快照 diff ----------
+// 各元素类型的 diff 键与参与比对的字段（快照里是发布时的完整实体）
+const DIFF_TYPES = [
+  { type: 'concepts', label: '概念', id: (e) => e.code, name: (e) => e.name,
+    fields: ['name', 'definition', 'domainCode'], fieldText: { name: '名称', definition: '定义', domainCode: '业务域' } },
+  { type: 'attributes', label: '属性', id: (e) => `${e.conceptCode}.${e.attrCode}`, name: (e) => e.attrName,
+    fields: ['attrName', 'dataType', 'definition'], fieldText: { attrName: '属性名', dataType: '数据类型', definition: '定义' } },
+  { type: 'relations', label: '关系', id: (e) => `${e.fromConcept} →${e.relationName}→ ${e.toConcept}`, name: () => '',
+    fields: ['description'], fieldText: { description: '描述' } },
+  { type: 'terms', label: '术语', id: (e) => e.term, name: (e) => e.conceptCode,
+    fields: ['termType', 'codeSystem', 'standardCode'], fieldText: { termType: '类型', codeSystem: '编码体系', standardCode: '标准编码' } },
+  { type: 'metrics', label: '指标', id: (e) => e.metricCode, name: (e) => e.name,
+    fields: ['name', 'definition', 'formula', 'warnThreshold'], fieldText: { name: '名称', definition: '口径定义', formula: '公式', warnThreshold: '告警阈值' } },
+  { type: 'rules', label: '规则', id: (e) => e.ruleCode, name: (e) => e.name,
+    fields: ['name', 'severity', 'engine'], fieldText: { name: '名称', severity: '级别', engine: '引擎' } },
+  { type: 'actions', label: '动作', id: (e) => e.actionCode, name: (e) => e.name,
+    fields: ['name', 'triggerDesc', 'fromStatus', 'toStatus'], fieldText: { name: '名称', triggerDesc: '触发说明', fromStatus: '前置状态', toStatus: '目标状态' } }
+]
+
+const diffVisible = ref(false)
+const loadingDiff = ref(false)
+const diffAId = ref(null)
+const diffBId = ref(null)
+const diffA = ref(null)
+const diffB = ref(null)
+const snapA = ref({})
+const snapB = ref({})
+
+const releasesDesc = computed(() => [...releases.value].sort((x, y) => y.id - x.id))
+
+// 结构化 diff：added/removed 按 key 集合，changed 比对字段值
+const diffGroupOf = (spec) => {
+  const aList = snapA.value[spec.type] || []
+  const bList = snapB.value[spec.type] || []
+  const mapA = new Map(aList.map((e) => [spec.id(e), e]))
+  const mapB = new Map(bList.map((e) => [spec.id(e), e]))
+  const added = bList.filter((e) => !mapA.has(spec.id(e))).map((e) => ({ key: spec.id(e), id: spec.id(e), name: spec.name(e) }))
+  const removed = aList.filter((e) => !mapB.has(spec.id(e))).map((e) => ({ key: spec.id(e), id: spec.id(e), name: spec.name(e) }))
+  const changed = []
+  for (const [key, ea] of mapA) {
+    const eb = mapB.get(key)
+    if (!eb) continue
+    const changes = {}
+    for (const f of spec.fields) {
+      const va = ea[f] ?? null
+      const vb = eb[f] ?? null
+      if (String(va) !== String(vb)) changes[f] = [va, vb]
+    }
+    if (Object.keys(changes).length) {
+      changed.push({ key, id: key, name: spec.name(eb), changes })
+    }
+  }
+  return { ...spec, added, removed, changed }
+}
+
+const diffGroups = computed(() =>
+  diffA.value && diffB.value
+    ? DIFF_TYPES.map(diffGroupOf).filter((g) => g.added.length || g.removed.length || g.changed.length)
+    : []
+)
+
+const diffSummary = computed(() => {
+  if (!diffB.value || !diffGroups.value.length) return null
+  const total = diffGroups.value.reduce(
+    (n, g) => n + g.added.length + g.removed.length + g.changed.length, 0
+  )
+  return { total, releasedAt: (diffB.value.createdAt || '').replace('T', ' ').slice(0, 16) }
+})
+
+const fieldText = (f) => {
+  for (const t of DIFF_TYPES) if (t.fieldText[f]) return t.fieldText[f]
+  return f
+}
+
+// OWL 风格 diff（由真实快照 diff 生成，节选前 26 行）
+const owlLines = computed(() => {
+  const lines = []
+  for (const g of diffGroups.value) {
+    for (const e of g.added) {
+      if (g.type === 'concepts') {
+        lines.push(`+ :${e.id} a owl:Class ;`)
+        lines.push(`+   rdfs:label "${e.name || e.id}"@zh .`)
+      } else if (g.type === 'attributes') {
+        lines.push(`+ :${e.id} a owl:DatatypeProperty ;`)
+        lines.push(`+   rdfs:label "${e.name || e.id}"@zh .`)
+      } else if (g.type === 'relations') {
+        lines.push(`+ ${e.id} .`)
+      } else {
+        lines.push(`+ :${e.id} rdfs:label "${e.name || e.id}"@zh . # ${g.label}`)
+      }
+    }
+    for (const e of g.changed) {
+      for (const [f, [va, vb]] of Object.entries(e.changes)) {
+        lines.push(`- :${e.id} ${f} "${va ?? ''}"`)
+        lines.push(`+ :${e.id} ${f} "${vb ?? ''}"`)
+      }
+    }
+    for (const e of g.removed) {
+      lines.push(`- :${e.id} a owl:Class . # ${g.label} 移除`)
+    }
+    if (lines.length > 26) break
+  }
+  if (lines.length > 26) lines.push(`... 共 ${diffSummary.value?.total ?? '-'} 处变更，已节选`)
+  return lines
+})
+
+const pickTimeline = (r) => {
+  // 点击时间线节点设为对比版本；基线自动取它的上一版
+  diffBId.value = r.id
+  const idx = releasesDesc.value.findIndex((x) => x.id === r.id)
+  const prev = releasesDesc.value[idx + 1]
+  if (prev) diffAId.value = prev.id
+  loadDiff()
+}
+
+const openDiff = () => {
+  const desc = releasesDesc.value
+  if (desc.length < 2) return
+  diffAId.value = desc[1].id
+  diffBId.value = desc[0].id
+  diffVisible.value = true
+  loadDiff()
+}
+
+const loadDiff = async () => {
+  if (!diffAId.value || !diffBId.value) return
+  loadingDiff.value = true
+  try {
+    const [da, db] = await Promise.all([releaseDetail(diffAId.value), releaseDetail(diffBId.value)])
+    diffA.value = da
+    diffB.value = db
+    snapA.value = JSON.parse(da.snapshotJson || '{}')
+    snapB.value = JSON.parse(db.snapshotJson || '{}')
+  } finally {
+    loadingDiff.value = false
+  }
+}
+
 // ---------- LLM 调用审计 ----------
 const logs = ref([])
 const logPage = ref(1)
@@ -466,5 +709,231 @@ onMounted(() => {
 .code-empty {
   color: #c0c4cc;
   font-size: 13px;
+}
+
+/* ---------- 变更图谱 ---------- */
+.diff-timeline {
+  margin-bottom: 14px;
+}
+
+.diff-timeline-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.diff-timeline-track {
+  display: flex;
+  align-items: flex-start;
+  overflow-x: auto;
+  padding-bottom: 6px;
+}
+
+.tl-node {
+  cursor: pointer;
+  text-align: center;
+  min-width: 76px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  transition: var(--transition, 0.2s);
+}
+
+.tl-node:hover {
+  background: #f5f7fa;
+}
+
+.tl-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #dcdfe6;
+  margin: 0 auto 6px;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px #dcdfe6;
+}
+
+.tl-node.sel .tl-dot {
+  background: var(--el-color-success);
+  box-shadow: 0 0 0 2px var(--el-color-success-light-5, #95d475);
+}
+
+.tl-node.base .tl-dot {
+  background: #909399;
+}
+
+.tl-tag {
+  font-size: 12px;
+  font-weight: 700;
+  color: #303133;
+}
+
+.tl-node.sel .tl-tag {
+  color: var(--el-color-success);
+}
+
+.tl-date {
+  font-size: 11px;
+  color: #909399;
+  margin-top: 2px;
+}
+
+.tl-line {
+  width: 40px;
+  height: 2px;
+  background: #e4e7ed;
+  margin-top: 11px;
+  flex-shrink: 0;
+}
+
+.diff-pickers {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.diff-arrow {
+  color: #909399;
+  font-size: 16px;
+}
+
+.diff-summary {
+  margin-left: auto;
+  font-size: 12px;
+  color: #606266;
+}
+
+.diff-card {
+  background: #fff;
+  border: 1px solid var(--el-border-color-light, #e4e7ed);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 14px;
+}
+
+.diff-card-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.dg-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #909399;
+  border-bottom: 1px dashed #ebeef5;
+  padding: 8px 0 4px;
+  margin-bottom: 6px;
+}
+
+.dg-name {
+  font-weight: 600;
+}
+
+.dg-counts em {
+  font-style: normal;
+  margin-left: 8px;
+  font-weight: 700;
+}
+
+.c-add {
+  color: var(--el-color-success);
+}
+
+.c-del {
+  color: var(--el-color-danger);
+}
+
+.c-chg {
+  color: var(--el-color-warning);
+}
+
+.dg-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  padding: 4px 0;
+  flex-wrap: wrap;
+}
+
+.dg-op {
+  flex-shrink: 0;
+}
+
+.dg-name2 {
+  color: #909399;
+  font-size: 12px;
+}
+
+.dg-fields {
+  display: inline-flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: #606266;
+}
+
+.dg-field s {
+  color: #c0c4cc;
+}
+
+.impact-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+
+.impact-box {
+  border: 1px solid var(--el-border-color-light, #e4e7ed);
+  border-radius: 8px;
+  padding: 10px;
+  text-align: center;
+}
+
+.impact-num {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--el-color-warning);
+}
+
+.impact-label {
+  font-size: 11px;
+  color: #909399;
+  margin-top: 2px;
+}
+
+.impact-none {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: #909399;
+  font-size: 12px;
+  padding: 8px;
+}
+
+.owl-diff {
+  margin: 0;
+  background: #0f172a;
+  border-radius: 6px;
+  padding: 12px;
+  font-family: 'SFMono-Regular', Consolas, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.8;
+  color: #94a3b8;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.owl-add {
+  color: #4ade80;
+}
+
+.owl-del {
+  color: #f87171;
+  text-decoration: line-through;
+  opacity: 0.7;
 }
 </style>

@@ -6,10 +6,12 @@ import com.bemodel.modeling.entity.Axiom;
 import com.bemodel.modeling.mapper.AxiomMapper;
 import com.bemodel.ontology.entity.Attribute;
 import com.bemodel.ontology.entity.Concept;
+import com.bemodel.ontology.entity.ConceptParent;
 import com.bemodel.ontology.entity.Domain;
 import com.bemodel.ontology.entity.Relation;
 import com.bemodel.ontology.mapper.AttributeMapper;
 import com.bemodel.ontology.mapper.ConceptMapper;
+import com.bemodel.ontology.mapper.ConceptParentMapper;
 import com.bemodel.ontology.mapper.DomainMapper;
 import com.bemodel.ontology.mapper.RelationMapper;
 import lombok.RequiredArgsConstructor;
@@ -45,7 +47,7 @@ import java.util.TreeSet;
  *   owl:Class/rdfs:Class → bm_concept（code=localName 转 UPPER_SNAKE，iri 原样保留）；
  *   owl:ObjectProperty   → bm_relation（domain/range→from/to，公理特性→结构公理列）；
  *   owl:DatatypeProperty → bm_attribute（range→data_type，无法映射降级 STRING）；
- *   rdfs:subClassOf      → bm_axiom（type='继承'，predicate='subClassOf'）。
+ *   rdfs:subClassOf      → bm_axiom（type='继承'，溯源）+ bm_concept_parent（结构化多父，第一个父为主父）。
  * 表达不了的 OWL 构造（disjointWith/equivalentClass/Restriction/匿名节点等）计入 unprojected，不报错：
  * “暂未投影”不是解析失败。
  */
@@ -62,6 +64,7 @@ public class OwlImportService {
     private final AttributeMapper attributeMapper;
     private final AxiomMapper axiomMapper;
     private final DomainMapper domainMapper;
+    private final ConceptParentMapper conceptParentMapper;
 
     public record ImportItem(String kind, String iri, String code, String name,
                              String disposition, String reason, Map<String, Object> detail) {
@@ -104,6 +107,12 @@ public class OwlImportService {
                     }
                 }
                 default -> throw new BizException("未知 disposition: " + item.disposition());
+            }
+        }
+        // 第二遍落继承边：此时同计划内的父概念已全部落库（按 code 排序时子类可能先于父类 apply）
+        for (ImportItem item : plan.items()) {
+            if ("CLASS".equals(item.kind()) && !"KEY_TAKEN".equals(item.disposition())) {
+                applyParentEdges(item);
             }
         }
         Map<String, Object> out = new LinkedHashMap<>();
@@ -330,7 +339,7 @@ public class OwlImportService {
             existing.setIri(item.iri());
             conceptMapper.updateById(existing);
         }
-        // rdfs:subClassOf → bm_axiom（继承），幂等：按生成的 axiom_code 判重
+        // rdfs:subClassOf → bm_axiom（继承，溯源用）；结构化 bm_concept_parent 边在第二遍 applyParentEdges 落
         for (String parent : (List<String>) detail.get("subClassOf")) {
             String axiomCode = inheritAxiomCode(item.code(), parent);
             Long cnt = axiomMapper.selectCount(new LambdaQueryWrapper<Axiom>()
@@ -346,6 +355,27 @@ public class OwlImportService {
                 axiom.setStatus("PUBLISHED");
                 axiomMapper.insert(axiom);
             }
+        }
+    }
+
+    /** 继承边落库（execute 第二遍）：父概念须已存在；第一个父为主父；按 (child,parent) 判重幂等 */
+    @SuppressWarnings("unchecked")
+    private void applyParentEdges(ImportItem item) {
+        int parentIdx = 0;
+        for (String parent : (List<String>) item.detail().get("subClassOf")) {
+            Long parentExists = conceptMapper.selectCount(new LambdaQueryWrapper<Concept>()
+                    .eq(Concept::getCode, parent));
+            Long pairExists = conceptParentMapper.selectCount(new LambdaQueryWrapper<ConceptParent>()
+                    .eq(ConceptParent::getChildCode, item.code())
+                    .eq(ConceptParent::getParentCode, parent));
+            if (parentExists != null && parentExists > 0 && (pairExists == null || pairExists == 0)) {
+                ConceptParent cp = new ConceptParent();
+                cp.setChildCode(item.code());
+                cp.setParentCode(parent);
+                cp.setIsPrimary(parentIdx == 0 ? 1 : 0);
+                conceptParentMapper.insert(cp);
+            }
+            parentIdx++;
         }
     }
 

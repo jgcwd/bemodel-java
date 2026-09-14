@@ -20,7 +20,15 @@ public class RdfService {
 
     private final DatasourceService datasourceService;
 
+    /**
+     * 导出患者 ABox。mask=true（默认）时患者姓名脱敏（张*三格式），
+     * mask=false 保留原名供调试（仅内网演示，勿用于外发）。
+     */
     public String exportPatient(String inhosNo) {
+        return exportPatient(inhosNo, true);
+    }
+
+    public String exportPatient(String inhosNo, boolean mask) {
         JdbcTemplate his = datasourceService.jdbc("DS_HIS");
         JdbcTemplate emr = datasourceService.jdbc("DS_EMR");
         JdbcTemplate lis = datasourceService.jdbc("DS_LIS");
@@ -32,20 +40,22 @@ public class RdfService {
             throw new BizException("患者不存在: " + inhosNo);
         }
         Map<String, Object> p = patients.get(0);
+        String patientName = mask ? maskName(String.valueOf(p.get("patient_name")))
+                : String.valueOf(p.get("patient_name"));
 
         StringBuilder sb = new StringBuilder();
         sb.append("@prefix med:  <http://bemodel.com/ontology/med#> .\n");
         sb.append("@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n");
         sb.append("@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .\n\n");
         sb.append("# ===== 患者 ABox（由 BeModel 实例装配器从产品库实时投影生成） =====\n");
-        sb.append("# 患者：").append(p.get("patient_name")).append(" 住院号：").append(inhosNo)
+        sb.append("# 患者：").append(patientName).append(" 住院号：").append(inhosNo)
                 .append(" 导出时间：").append(java.time.LocalDateTime.now()).append('\n');
         sb.append("# 覆盖 SHACL 输入：Shape1 过敏禁忌 / Shape2 剂量上限 / Shape3 儿童禁用 / Shape4 性别互斥 / Shape5 相互作用 / Shape6 审核闭环\n\n");
 
         String patientUri = "med:Patient_" + inhosNo;
         String encUri = "med:InpEncounter_" + inhosNo;
         sb.append(patientUri).append(" a med:Patient ;\n")
-                .append("   rdfs:label \"").append(p.get("patient_name")).append("\" ;\n")
+                .append("   rdfs:label \"").append(patientName).append("\" ;\n")
                 .append("   med:sex \"").append(p.get("sex")).append("\" ;\n")
                 .append("   med:age \"").append(p.get("age")).append("\"^^xsd:integer ;\n")
                 .append("   med:hasEncounter ").append(encUri).append(" .\n\n");
@@ -177,5 +187,19 @@ public class RdfService {
                     .append(r.get("item_name")).append("\" .\n\n");
         }
         return sb.toString();
+    }
+
+    /** 姓名脱敏：张*三（两字名 张*；单字/空 → *） */
+    static String maskName(String name) {
+        if (name == null || name.isEmpty()) {
+            return "*";
+        }
+        if (name.length() == 1) {
+            return "*";
+        }
+        if (name.length() == 2) {
+            return name.charAt(0) + "*";
+        }
+        return name.charAt(0) + "*" + name.substring(name.length() - 1);
     }
 }

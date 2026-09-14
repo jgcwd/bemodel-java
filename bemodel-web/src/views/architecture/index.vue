@@ -36,20 +36,30 @@
 
     <!-- 工具栏 -->
     <div class="toolbar">
-      <el-input
-        v-model="keyword"
-        placeholder="按名称 / 编码搜索节点"
-        clearable
-        :prefix-icon="Search"
-        style="width: 260px"
-      />
-      <el-switch v-model="onlyUnmapped" class="unmapped-switch" />
-      <span class="switch-label">只看未映射概念</span>
-      <span class="toolbar-tip">点击节点跳转到对应管理页面；图例可开关某类节点</span>
+      <el-radio-group v-model="viewMode">
+        <el-radio-button value="entities">实体全景</el-radio-button>
+        <el-radio-button value="layers">分层架构</el-radio-button>
+      </el-radio-group>
+      <template v-if="viewMode === 'entities'">
+        <el-input
+          v-model="keyword"
+          placeholder="按名称 / 编码搜索节点"
+          clearable
+          :prefix-icon="Search"
+          style="width: 260px"
+        />
+        <el-switch v-model="onlyUnmapped" class="unmapped-switch" />
+        <span class="switch-label">只看未映射概念</span>
+      </template>
+      <span class="toolbar-tip">{{
+        viewMode === 'entities'
+          ? '点击节点跳转到对应管理页面；图例可开关某类节点'
+          : '四层语义架构：业务应用 → 推理引擎 → 数据映射 → 本体；点击节点进入对应模块'
+      }}</span>
     </div>
 
-    <!-- 分层架构图 -->
-    <el-card>
+    <!-- 分层架构图（真实实体，ECharts） -->
+    <el-card v-if="viewMode === 'entities'">
       <el-empty v-if="!loading && !rawNodes.length" description="暂无架构数据" />
       <div v-else class="canvas-scroll">
         <GraphCanvas
@@ -66,6 +76,11 @@
         />
       </div>
     </el-card>
+
+    <!-- 四层语义架构全景（移植自 demo 架构全貌） -->
+    <el-card v-else>
+      <PanoramaGraph />
+    </el-card>
   </div>
 </template>
 
@@ -74,9 +89,13 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { Search } from '@element-plus/icons-vue'
 import GraphCanvas from '../../components/GraphCanvas.vue'
+import PanoramaGraph from './PanoramaGraph.vue'
 import { getArchitectureOverview } from '../../api/architecture'
 
 const router = useRouter()
+
+// 视图切换：实体全景（ECharts 真实数据） / 分层架构（四层语义叙事图）
+const viewMode = ref('entities')
 
 // ---------- 节点类型样式 ----------
 const TYPE_STYLE = {

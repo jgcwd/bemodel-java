@@ -7,10 +7,12 @@ import com.bemodel.datasource.entity.Mapping;
 import com.bemodel.datasource.mapper.MappingMapper;
 import com.bemodel.ontology.entity.Attribute;
 import com.bemodel.ontology.entity.Concept;
+import com.bemodel.ontology.entity.ConceptParent;
 import com.bemodel.ontology.entity.Relation;
 import com.bemodel.ontology.entity.Term;
 import com.bemodel.ontology.mapper.AttributeMapper;
 import com.bemodel.ontology.mapper.ConceptMapper;
+import com.bemodel.ontology.mapper.ConceptParentMapper;
 import com.bemodel.ontology.mapper.RelationMapper;
 import com.bemodel.ontology.mapper.TermMapper;
 import lombok.RequiredArgsConstructor;
@@ -29,6 +31,7 @@ public class ConceptService extends ServiceImpl<ConceptMapper, Concept> {
     private final RelationMapper relationMapper;
     private final TermMapper termMapper;
     private final MappingMapper mappingMapper;
+    private final ConceptParentMapper conceptParentMapper;
 
     private static final Set<String> STATUS = Set.of("DRAFT", "REVIEW", "PUBLISHED", "DEPRECATED");
     private static final Map<String, Set<String>> TRANSITIONS = Map.of(
@@ -66,7 +69,97 @@ public class ConceptService extends ServiceImpl<ConceptMapper, Concept> {
         detail.put("terms", termMapper.selectList(
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<Term>()
                         .eq(Term::getConceptCode, code)));
+        detail.put("parents", listParents(code));
         return detail;
+    }
+
+    // ---------- 多父继承 ----------
+
+    public List<ConceptParent> listParents(String code) {
+        return conceptParentMapper.selectList(new LambdaQueryWrapper<ConceptParent>()
+                .eq(ConceptParent::getChildCode, code)
+                .orderByDesc(ConceptParent::getIsPrimary).orderByAsc(ConceptParent::getParentCode));
+    }
+
+    /** 加父：父子都存在、不相同、不重复、不成环（child 已是 parent 的祖先则拒绝） */
+    public ConceptParent addParent(String code, String parentCode, Integer isPrimary) {
+        Concept child = getByCode(code);
+        if (child == null) {
+            throw new BizException("概念不存在: " + code);
+        }
+        if (parentCode == null || parentCode.isBlank()) {
+            throw new BizException("父概念编码不能为空");
+        }
+        if (code.equals(parentCode)) {
+            throw new BizException("概念不能继承自身: " + code);
+        }
+        if (getByCode(parentCode) == null) {
+            throw new BizException("父概念不存在: " + parentCode);
+        }
+        if (conceptParentMapper.selectCount(new LambdaQueryWrapper<ConceptParent>()
+                .eq(ConceptParent::getChildCode, code)
+                .eq(ConceptParent::getParentCode, parentCode)) > 0) {
+            throw new BizException("继承关系已存在: " + code + " → " + parentCode);
+        }
+        if (ancestorsOf(parentCode).contains(code)) {
+            throw new BizException("不允许成环: " + parentCode + " 的祖先链上已存在 " + code);
+        }
+        ConceptParent cp = new ConceptParent();
+        cp.setChildCode(code);
+        cp.setParentCode(parentCode);
+        cp.setIsPrimary(Integer.valueOf(1).equals(isPrimary) ? 1 : 0);
+        if (cp.getIsPrimary() == 1) {
+            clearPrimary(code);
+        }
+        conceptParentMapper.insert(cp);
+        return cp;
+    }
+
+    public void removeParent(String code, String parentCode) {
+        conceptParentMapper.delete(new LambdaQueryWrapper<ConceptParent>()
+                .eq(ConceptParent::getChildCode, code)
+                .eq(ConceptParent::getParentCode, parentCode));
+    }
+
+    /** 设主父：同 child 唯一主父 */
+    public ConceptParent setPrimaryParent(String code, String parentCode) {
+        ConceptParent cp = conceptParentMapper.selectOne(new LambdaQueryWrapper<ConceptParent>()
+                .eq(ConceptParent::getChildCode, code)
+                .eq(ConceptParent::getParentCode, parentCode).last("LIMIT 1"));
+        if (cp == null) {
+            throw new BizException("继承关系不存在: " + code + " → " + parentCode);
+        }
+        clearPrimary(code);
+        cp.setIsPrimary(1);
+        conceptParentMapper.updateById(cp);
+        return cp;
+    }
+
+    private void clearPrimary(String childCode) {
+        List<ConceptParent> primaries = conceptParentMapper.selectList(new LambdaQueryWrapper<ConceptParent>()
+                .eq(ConceptParent::getChildCode, childCode).eq(ConceptParent::getIsPrimary, 1));
+        for (ConceptParent p : primaries) {
+            p.setIsPrimary(0);
+            conceptParentMapper.updateById(p);
+        }
+    }
+
+    /** 全部祖先（沿 parent 链向上 BFS；带 visited 防既有数据成环时死循环） */
+    public java.util.Set<String> ancestorsOf(String code) {
+        java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+        java.util.Deque<String> queue = new java.util.ArrayDeque<>();
+        queue.add(code);
+        while (!queue.isEmpty()) {
+            String cur = queue.poll();
+            for (ConceptParent p : conceptParentMapper.selectList(new LambdaQueryWrapper<ConceptParent>()
+                    .eq(ConceptParent::getChildCode, cur))) {
+                if (seen.add(p.getParentCode())) {
+                    queue.add(p.getParentCode());
+                }
+            }
+        }
+        seen.remove(code);
+        return seen;
     }
 
     public Concept create(Concept concept) {
@@ -96,9 +189,12 @@ public class ConceptService extends ServiceImpl<ConceptMapper, Concept> {
                 new LambdaQueryWrapper<Term>().eq(Term::getConceptCode, code));
         long mappings = mappingMapper.selectCount(
                 new LambdaQueryWrapper<Mapping>().eq(Mapping::getConceptCode, code));
-        if (attrs + rels + terms + mappings > 0) {
+        long parents = conceptParentMapper.selectCount(new LambdaQueryWrapper<ConceptParent>()
+                .eq(ConceptParent::getChildCode, code).or().eq(ConceptParent::getParentCode, code));
+        if (attrs + rels + terms + mappings + parents > 0) {
             throw new BizException(String.format(
-                    "概念存在引用，拒绝删除: 属性%d个、关系%d条、术语%d条、字段映射%d条", attrs, rels, terms, mappings));
+                    "概念存在引用，拒绝删除: 属性%d个、关系%d条、术语%d条、字段映射%d条、继承边%d条",
+                    attrs, rels, terms, mappings, parents));
         }
         removeById(concept.getId());
     }

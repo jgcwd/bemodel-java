@@ -13,8 +13,8 @@ body,
 body {
   font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei', Arial, sans-serif;
-  background-color: #f0f2f5;
-  color: #303133;
+  background-color: var(--main-bg, #f5f7fa);
+  color: var(--text-primary, #1a2332);
 }
 
 .page {

@@ -70,9 +70,25 @@
             <template #header>
               <div class="card-header">
                 <span>病案信息</span>
-                <el-button type="primary" :loading="checking" @click="runCheck">
-                  发起内涵质控
-                </el-button>
+                <div>
+                  <el-tooltip
+                    content="平台内置 SHACL 校验（Jena），对该患者导出的 ABox 执行 sh:validate 复核"
+                    placement="top"
+                  >
+                    <span>
+                      <el-button
+                        type="success"
+                        plain
+                        :disabled="!current.inhos_no"
+                        :loading="validating"
+                        @click="runValidate"
+                      >SHACL 复核</el-button>
+                    </span>
+                  </el-tooltip>
+                  <el-button type="primary" :loading="checking" @click="runCheck">
+                    发起内涵质控
+                  </el-button>
+                </div>
               </div>
             </template>
             <el-descriptions :column="2" border size="small">
@@ -135,10 +151,10 @@
                   <el-table-column width="170">
                     <template #header>
                       <el-tooltip
-                        content="对应 SHACL Shape 已在顶层模板定义，导出 ABox 后可用 Jena/RDF4J 校验复核"
+                        content="平台内置 SHACL 校验（Jena），可对任一患者一键复核"
                         placement="top"
                       >
-                        <span>SHACL 就绪</span>
+                        <span>SHACL 已互证</span>
                       </el-tooltip>
                     </template>
                     <template #default="{ row }">
@@ -217,6 +233,46 @@
         </el-card>
       </el-col>
     </el-row>
+
+    <!-- SHACL 复核结果 -->
+    <el-dialog v-model="validateVisible" title="SHACL 复核" width="720px">
+      <template v-if="validateResult">
+        <div class="validate-summary">
+          <el-tag
+            :type="validateResult.conforms ? 'success' : 'danger'"
+            effect="dark"
+            size="large"
+          >{{ validateResult.conforms ? '通过' : '不通过' }}</el-tag>
+          <span class="validate-meta">
+            {{ validateResult.engine }} ｜ {{ validateResult.shapes }}
+          </span>
+        </div>
+        <el-table
+          v-if="(validateResult.violations || []).length"
+          :data="validateResult.violations"
+          size="small"
+          style="margin-top: 12px"
+        >
+          <el-table-column prop="focusNode" label="焦点节点" min-width="220" show-overflow-tooltip />
+          <el-table-column label="路径" width="120">
+            <template #default="{ row }">{{ row.path || '-' }}</template>
+          </el-table-column>
+          <el-table-column prop="message" label="违规说明" min-width="220" show-overflow-tooltip />
+          <el-table-column label="级别" width="90">
+            <template #default="{ row }">
+              <el-tag size="small" type="danger" effect="plain">{{ row.severity }}</el-tag>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-alert
+          v-else
+          type="success"
+          :closable="false"
+          title="未发现 SHACL 违规"
+          style="margin-top: 12px"
+        />
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -224,7 +280,7 @@
 import { ref, onMounted } from 'vue'
 import { ElMessage, ElLoading } from 'element-plus'
 import { Search } from '@element-plus/icons-vue'
-import { listQcRecords, checkQc, checkAllQc, qcResult } from '../../../api/clinical'
+import { listQcRecords, checkQc, checkAllQc, qcResult, validateRdf } from '../../../api/clinical'
 
 // ---------- 病案列表 ----------
 const keyword = ref('')
@@ -295,6 +351,22 @@ const result = ref(null)
 const resultAt = ref('')
 const checking = ref(false)
 const loadingResult = ref(false)
+
+// ---------- SHACL 复核（平台内置 Jena 校验） ----------
+const validating = ref(false)
+const validateVisible = ref(false)
+const validateResult = ref(null)
+
+const runValidate = async () => {
+  if (!current.value?.inhos_no) return
+  validating.value = true
+  try {
+    validateResult.value = await validateRdf(current.value.inhos_no)
+    validateVisible.value = true
+  } finally {
+    validating.value = false
+  }
+}
 
 const selectRecord = async (row) => {
   current.value = row
@@ -432,5 +504,16 @@ onMounted(loadRecords)
   padding: 1px 8px;
   margin: 1px 4px 1px 0;
   line-height: 1.6;
+}
+
+.validate-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.validate-meta {
+  font-size: 12px;
+  color: #909399;
 }
 </style>

@@ -69,12 +69,17 @@ public class SemanticQaService {
      * 计划解析失败/LLM 不可用不记（非语义层缺口）。
      */
     public Outcome answer(String q) {
+        return answer(q, false);
+    }
+
+    /** analytics=true 表示来自智能问数场景（缺口来源记 QA_ASK，与客服 CS_ASK 区分） */
+    public Outcome answer(String q, boolean analytics) {
         Plan plan = planQuery(q);
         if (plan == null) {
             return new Outcome(null, false);
         }
         if ("UNANSWERABLE".equals(plan.mode())) {
-            recordQuestionMiss(q);
+            recordQuestionMiss(q, analytics);
             return new Outcome(null, true);
         }
         if ("MODEL_ANSWER".equals(plan.mode())) {
@@ -86,7 +91,7 @@ public class SemanticQaService {
         Set<String> tables = allowedTables(plan.ds());
         Set<String> columns = allowedColumns(plan.ds());
         if (tables.isEmpty()) {
-            recordQuestionMiss(q);
+            recordQuestionMiss(q, analytics);
             return new Outcome(null, true);
         }
         String sql;
@@ -94,7 +99,7 @@ public class SemanticQaService {
             sql = validateSql(plan.sql(), tables, columns);
         } catch (BizException e) {
             log.warn("语义查询 SQL 校验未过（降级能力菜单）: {}", e.getMessage());
-            recordQuestionMiss(q);
+            recordQuestionMiss(q, analytics);
             return new Outcome(null, true);
         }
         List<Map<String, Object>> rows;
@@ -106,7 +111,7 @@ public class SemanticQaService {
             rows = jdbc.queryForList(sql);
         } catch (Exception e) {
             log.warn("语义查询执行失败（降级能力菜单）: {}", e.getMessage());
-            recordQuestionMiss(q);
+            recordQuestionMiss(q, analytics);
             return new Outcome(null, true);
         }
         int total = rows.size();
@@ -127,12 +132,78 @@ public class SemanticQaService {
                 Map.of("label", "数据源", "value", plan.ds() + " / " + String.join(",", usedTables)),
                 Map.of("label", "结果行数", "value", total + (total > 20 ? "（展示前20行）" : ""))));
         result.put("links", conceptLinks(plan.ds(), usedTables));
+        // 结构化解析（智能问数侧栏）：概念匹配/关系链来自本体真实结构，行数据来自真实查询，不编造置信度
+        result.put("semantics", plan.semantics());
+        result.put("rows", view);
+        fillParse(result, q + " " + plan.semantics());
         return new Outcome(result, false);
     }
 
-    /** 答不了的问题回流本体增长回路（kind=QUESTION/source=CS_ASK，静默降级在 recordMiss 内部） */
-    private void recordQuestionMiss(String q) {
-        missService.recordMiss(q, "QUESTION", "CS_ASK");
+    /** 往结果里补 概念匹配 + 关系推理链（问题与语义计划文本中真实命中的本体结构） */
+    private void fillParse(Map<String, Object> result, String text) {
+        try {
+            List<Map<String, Object>> matched = matchConcepts(text);
+            result.put("matchedConcepts", matched);
+            result.put("relations", relatedRelations(matched.stream()
+                    .map(m -> String.valueOf(m.get("code"))).toList()));
+        } catch (Exception e) {
+            log.warn("解析字段构建失败（不影响主回答）: {}", e.getMessage());
+            result.put("matchedConcepts", List.of());
+            result.put("relations", List.of());
+        }
+    }
+
+    /** 问题/语义文本中命中的 PUBLISHED 概念：中文名(≥2字)包含或编码包含 */
+    private List<Map<String, Object>> matchConcepts(String text) {
+        if (text == null || text.isBlank()) {
+            return List.of();
+        }
+        String lower = text.toLowerCase();
+        List<Map<String, Object>> hits = new ArrayList<>();
+        for (Concept c : conceptMapper.selectList(
+                new LambdaQueryWrapper<Concept>().eq(Concept::getStatus, "PUBLISHED"))) {
+            String how = null;
+            if (c.getName() != null && c.getName().length() >= 2 && text.contains(c.getName())) {
+                how = "名称";
+            } else if (c.getCode() != null && c.getCode().length() >= 2
+                    && lower.contains(c.getCode().toLowerCase())) {
+                how = "编码";
+            }
+            if (how != null) {
+                hits.add(Map.of("code", c.getCode(), "name", c.getName() == null ? c.getCode() : c.getName(),
+                        "match", how));
+            }
+            if (hits.size() >= 6) {
+                break;
+            }
+        }
+        return hits;
+    }
+
+    /** 命中概念相关的关系（作为推理链展示），限 8 条 */
+    private List<Map<String, Object>> relatedRelations(List<String> codes) {
+        if (codes.isEmpty()) {
+            return List.of();
+        }
+        List<Relation> rels = relationMapper.selectList(new LambdaQueryWrapper<Relation>()
+                .in(Relation::getFromConcept, codes).or().in(Relation::getToConcept, codes));
+        Map<String, String> conceptName = new LinkedHashMap<>();
+        conceptMapper.selectList(new LambdaQueryWrapper<Concept>().eq(Concept::getStatus, "PUBLISHED"))
+                .forEach(c -> conceptName.put(c.getCode(), c.getName()));
+        return rels.stream().limit(8).map(r -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("from", r.getFromConcept());
+            m.put("fromName", conceptName.getOrDefault(r.getFromConcept(), r.getFromConcept()));
+            m.put("relation", r.getRelationName());
+            m.put("to", r.getToConcept());
+            m.put("toName", conceptName.getOrDefault(r.getToConcept(), r.getToConcept()));
+            return m;
+        }).toList();
+    }
+
+    /** 答不了的问题回流本体增长回路（kind=QUESTION，source 按提问场景区分 CS_ASK/QA_ASK，静默降级在 recordMiss 内部） */
+    private void recordQuestionMiss(String q, boolean analytics) {
+        missService.recordMiss(q, "QUESTION", analytics ? "QA_ASK" : "CS_ASK");
     }
 
     /**

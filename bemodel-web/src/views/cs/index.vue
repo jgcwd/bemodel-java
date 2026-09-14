@@ -34,11 +34,11 @@
           <el-tag size="small" type="success" effect="plain">{{ askAnswer.intent }}</el-tag>
           <el-tooltip
             v-if="askAnswer.router"
-            :content="{ RULE: '关键词规则直接命中，答案来自业务库实时查询', LLM: '问题由 AI 归类到该能力，答案仍来自业务库实时查询（AI 只负责路由，不生成内容）', SEMANTIC: 'AI 理解问题后基于本体语义层（概念→映射→物理表）生成查询并实时执行，数字来自业务库', NONE: '未命中任何能力，展示能力菜单' }[askAnswer.router]"
+            :content="{ RULE: '关键词规则直接命中，答案来自业务库实时查询', LLM: '问题由 AI 归类到该能力，答案仍来自业务库实时查询（AI 只负责路由，不生成内容）', SEMANTIC: 'AI 理解问题后基于本体语义层（概念→映射→物理表）生成查询并实时执行，数字来自业务库', REFERRAL: '未命中本场景能力，已给出转到另一场景的入口（带原问题跳转）', NONE: '未命中任何能力，展示能力菜单' }[askAnswer.router]"
             placement="top"
           >
-            <el-tag size="small" :type="{ LLM: 'warning', SEMANTIC: 'success' }[askAnswer.router] || 'info'" effect="plain">
-              {{ { RULE: '规则路由', LLM: 'AI 归类', SEMANTIC: '语义查询', NONE: '未命中' }[askAnswer.router] }}
+            <el-tag size="small" :type="{ LLM: 'warning', SEMANTIC: 'success', REFERRAL: 'warning' }[askAnswer.router] || 'info'" effect="plain">
+              {{ { RULE: '规则路由', LLM: 'AI 归类', SEMANTIC: '语义查询', REFERRAL: '场景转介', NONE: '未命中' }[askAnswer.router] }}
             </el-tag>
           </el-tooltip>
           <span class="ask-question">问：{{ askAnswer.question }}</span>
@@ -59,8 +59,43 @@
             @click="goRoute(l.route)"
           >{{ l.label }} →</el-button>
         </div>
+        <div class="ask-feedback">
+          <template v-if="!feedbackDone">
+            <span class="ask-feedback-label">这个回答有帮助吗？</span>
+            <el-button
+              size="small"
+              text
+              type="primary"
+              :loading="sendingFeedback"
+              @click="sendFeedback(1)"
+            >👍 有用</el-button>
+            <el-button
+              size="small"
+              text
+              type="danger"
+              :loading="sendingFeedback"
+              @click="openFeedbackDialog"
+            >👎 归类不对</el-button>
+          </template>
+          <span v-else class="ask-feedback-done">已反馈</span>
+        </div>
       </div>
     </el-card>
+
+    <!-- 👎 反馈对话框 -->
+    <el-dialog v-model="feedbackDialogVisible" title="反馈归类问题" width="480px">
+      <p class="feedback-question">问：{{ askAnswer?.question }}</p>
+      <el-input
+        v-model="feedbackComment"
+        type="textarea"
+        :rows="3"
+        placeholder="正确意图应该是什么 / 哪里不对（可选）"
+      />
+      <template #footer>
+        <el-button @click="feedbackDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="sendingFeedback" @click="submitNegative">提交反馈</el-button>
+      </template>
+    </el-dialog>
 
     <el-row :gutter="16" style="margin-top: 16px">
       <!-- 左栏：客服工单 -->
@@ -320,7 +355,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { listTickets, ticketDiagnosis, refundTicket, askCs } from '../../api/cs'
+import { listTickets, ticketDiagnosis, refundTicket, askCs, submitCsFeedback } from '../../api/cs'
 
 const route = useRoute()
 const router = useRouter()
@@ -335,8 +370,8 @@ const quickQuestions = [
   '没缴费可以发药吗？',
   '一个医嘱可以分开发药吗？',
   '一次性输液器还有多少库存？',
-  '王芳是谁？',
-  '出院人数怎么算？'
+  '发药后可以部分退药吗？',
+  '王芳是谁？'
 ]
 
 const doAsk = async (q) => {
@@ -345,13 +380,51 @@ const doAsk = async (q) => {
   question.value = text
   asking.value = true
   try {
-    askAnswer.value = await askCs(text)
+    askAnswer.value = await askCs(text, 'CS')
+    feedbackDone.value = false
+    feedbackComment.value = ''
+  } catch {
+    // 失败提示由拦截器统一展示（如只读角色 403）
   } finally {
     asking.value = false
   }
 }
 
 const goRoute = (r) => router.push(r)
+
+// ---------- 回答反馈（错例回流进 LLM 路由提示词） ----------
+const feedbackDone = ref(false)
+const sendingFeedback = ref(false)
+const feedbackDialogVisible = ref(false)
+const feedbackComment = ref('')
+
+const sendFeedback = async (correct, comment) => {
+  if (!askAnswer.value || feedbackDone.value) return
+  sendingFeedback.value = true
+  try {
+    await submitCsFeedback({
+      question: askAnswer.value.question,
+      intent: askAnswer.value.intent,
+      router: askAnswer.value.router,
+      correct,
+      ...(comment?.trim() ? { comment: comment.trim() } : {})
+    })
+    feedbackDone.value = true
+    ElMessage.success(correct === 1 ? '感谢反馈' : '反馈已记录，将用于修正后续归类')
+  } finally {
+    sendingFeedback.value = false
+  }
+}
+
+const openFeedbackDialog = () => {
+  feedbackComment.value = ''
+  feedbackDialogVisible.value = true
+}
+
+const submitNegative = async () => {
+  await sendFeedback(0, feedbackComment.value)
+  feedbackDialogVisible.value = false
+}
 
 // ---------- 工单列表 ----------
 const tickets = ref([])
@@ -509,6 +582,9 @@ const stepTypeTag = (t) =>
   ({ TRAVERSE: 'primary', PROBE: 'warning', LINK: 'success', REPORT: 'danger' }[t] || 'info')
 
 onMounted(async () => {
+  // 承接智能问数页「业务咨询？去 AI 客服」转介深链：带原问题直接提问
+  const q0 = route.query.q
+  if (q0) doAsk(String(q0))
   await loadTickets()
   const ticketId = Number(route.query.ticketId)
   if (ticketId) {
@@ -602,6 +678,30 @@ onMounted(async () => {
 
 .ask-links {
   margin-top: 10px;
+}
+
+.ask-feedback {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ask-feedback-label {
+  font-size: 12px;
+  color: #909399;
+  margin-right: 4px;
+}
+
+.ask-feedback-done {
+  font-size: 12px;
+  color: #67c23a;
+}
+
+.feedback-question {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: #606266;
 }
 
 .step-note {

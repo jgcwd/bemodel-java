@@ -53,6 +53,35 @@ public class ConceptController {
         return Result.ok();
     }
 
+    // ---------- 多父继承 ----------
+
+    @GetMapping("/{code}/parents")
+    public Result<List<com.bemodel.ontology.entity.ConceptParent>> parents(@PathVariable String code) {
+        return Result.ok(conceptService.listParents(code));
+    }
+
+    @PostMapping("/{code}/parents")
+    public Result<com.bemodel.ontology.entity.ConceptParent> addParent(@PathVariable String code,
+                                                                       @RequestBody Map<String, Object> body) {
+        Object primary = body.get("isPrimary");
+        Integer isPrimary = primary == null ? 0
+                : (Boolean.parseBoolean(String.valueOf(primary)) || "1".equals(String.valueOf(primary)) ? 1 : 0);
+        return Result.ok(conceptService.addParent(code,
+                body.get("parentCode") == null ? null : String.valueOf(body.get("parentCode")), isPrimary));
+    }
+
+    @DeleteMapping("/{code}/parents/{parentCode}")
+    public Result<Void> removeParent(@PathVariable String code, @PathVariable String parentCode) {
+        conceptService.removeParent(code, parentCode);
+        return Result.ok();
+    }
+
+    @PutMapping("/{code}/parents/{parentCode}/primary")
+    public Result<com.bemodel.ontology.entity.ConceptParent> setPrimaryParent(@PathVariable String code,
+                                                                              @PathVariable String parentCode) {
+        return Result.ok(conceptService.setPrimaryParent(code, parentCode));
+    }
+
     @PostMapping("/attribute")
     public Result<Attribute> addAttribute(@RequestBody Attribute attribute) {
         attributeMapper.insert(attribute);

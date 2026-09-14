@@ -6,7 +6,7 @@ spring:
     name: bemodel-server
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
-    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:bemodel_platform}?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    url: jdbc:mysql://127.0.0.1:3306/bemodel_platform?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
     username: ${MYSQL_USERNAME:}
     password: ${MYSQL_PASSWORD:}
   flyway:
@@ -34,6 +34,17 @@ deepseek:
   api-key: ${DEEPSEEK_API_KEY:}
   model: deepseek-v4-flash
   timeout-seconds: 30
+
+# 安全：JWT 签名密钥 / 字段级加密密钥（默认值为演示便利，生产必须经环境变量覆盖）
+jwt:
+  secret: ${JWT_SECRET:}
+app:
+  secret-key: ${APP_SECRET_KEY:}
+
+# 指标定时巡检（cron 六字段含秒，默认每 30 分钟；手动触发 POST /api/inspect/run）
+bemodel:
+  inspect:
+    cron: "0 0/30 * * * *"
 
 logging:
   level:

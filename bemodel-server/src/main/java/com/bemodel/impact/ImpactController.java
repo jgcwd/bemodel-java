@@ -18,6 +18,11 @@ public class ImpactController {
 
     @PostMapping("/analyze")
     public Result<Map<String, Object>> analyze(@RequestBody Map<String, String> body) {
-        return Result.ok(impactService.analyze(body.get("conceptCode"), body.get("changeDesc")));
+        String depthStr = body.get("depth");
+        Integer depth = null;
+        if (depthStr != null && !depthStr.isBlank()) {
+            depth = Integer.valueOf(depthStr);
+        }
+        return Result.ok(impactService.analyze(body.get("conceptCode"), body.get("changeDesc"), depth));
     }
 }

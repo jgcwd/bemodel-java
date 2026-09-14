@@ -9,7 +9,11 @@
               <template #header>
                 <div class="card-header">
                   <span>业务域</span>
-                  <el-button size="small" @click="openDomainDialog">新建域</el-button>
+                  <el-tooltip content="只读角色无写权限" :disabled="!userStore.isViewer" placement="top">
+                    <span>
+                      <el-button size="small" :disabled="userStore.isViewer" @click="openDomainDialog">新建域</el-button>
+                    </span>
+                  </el-tooltip>
                 </div>
               </template>
               <el-tree
@@ -37,8 +41,15 @@
                     >
                       <el-button @click="openProposalDrawer">扩展提案</el-button>
                     </el-badge>
-                    <el-button @click="openImportDialog">导入 OWL</el-button>
-                    <el-button type="primary" @click="openConceptDialog('create')">新建概念</el-button>
+                    <template v-if="!userStore.isViewer">
+                      <el-button @click="openImportDialog">导入 OWL</el-button>
+                      <el-button type="primary" @click="openConceptDialog('create')">新建概念</el-button>
+                    </template>
+                    <el-tooltip v-else content="只读角色无写权限" placement="top">
+                      <span>
+                        <el-button type="primary" disabled>新建概念</el-button>
+                      </span>
+                    </el-tooltip>
                   </div>
                 </div>
               </template>
@@ -80,7 +91,7 @@
         >
           <el-tabs v-model="activeInnerTab">
             <el-tab-pane label="属性" name="attrs">
-              <div class="pane-toolbar">
+              <div class="pane-toolbar" v-if="!userStore.isViewer">
                 <el-button size="small" type="primary" @click="openAttrDialog">新增属性</el-button>
               </div>
               <el-table :data="detail.attributes" size="small">
@@ -96,7 +107,7 @@
                 <el-table-column prop="definition" label="定义" show-overflow-tooltip />
                 <el-table-column label="操作" width="70">
                   <template #default="{ row }">
-                    <el-button size="small" type="danger" link @click="removeAttribute(row)">
+                    <el-button v-if="!userStore.isViewer" size="small" type="danger" link @click="removeAttribute(row)">
                       删除
                     </el-button>
                   </template>
@@ -104,7 +115,7 @@
               </el-table>
             </el-tab-pane>
             <el-tab-pane label="关系" name="relations">
-              <div class="pane-toolbar">
+              <div class="pane-toolbar" v-if="!userStore.isViewer">
                 <el-button size="small" type="primary" @click="openRelationDialog('create')">新建关系</el-button>
               </div>
               <el-table :data="detail.relations" size="small">
@@ -120,16 +131,53 @@
                 <el-table-column prop="description" label="说明" show-overflow-tooltip />
                 <el-table-column label="操作" width="110">
                   <template #default="{ row }">
-                    <el-button size="small" link type="primary" @click="openRelationDialog('edit', row)">
+                    <el-button v-if="!userStore.isViewer" size="small" link type="primary" @click="openRelationDialog('edit', row)">
                       编辑
                     </el-button>
-                    <el-button size="small" type="danger" link @click="removeRelation(row)">
+                    <el-button v-if="!userStore.isViewer" size="small" type="danger" link @click="removeRelation(row)">
                       删除
                     </el-button>
                   </template>
                 </el-table-column>
               </el-table>
               <el-empty v-if="!detail.relations.length" description="暂无关系" :image-size="60" />
+            </el-tab-pane>
+            <el-tab-pane label="继承" name="inherit">
+              <div class="pane-toolbar" v-if="!userStore.isViewer">
+                <el-button size="small" type="primary" @click="openParentDialog">添加父概念</el-button>
+                <span class="inherit-tip">多父继承用于「属于」类层级建模；主父为默认归属</span>
+              </div>
+              <el-table :data="detail.parents || []" size="small">
+                <el-table-column label="父概念" min-width="200">
+                  <template #default="{ row }">
+                    <el-tag size="small" effect="plain">{{ row.parentCode }}</el-tag>
+                    <span class="parent-name">{{ conceptNameOf(row.parentCode) }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="主父" width="80" align="center">
+                  <template #default="{ row }">
+                    <el-tag v-if="row.isPrimary === 1" size="small" type="warning" effect="dark">
+                      ★ 主父
+                    </el-tag>
+                    <span v-else>-</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="操作" width="130">
+                  <template #default="{ row }">
+                    <el-button
+                      v-if="row.isPrimary !== 1 && !userStore.isViewer"
+                      size="small"
+                      link
+                      type="primary"
+                      @click="doSetPrimaryParent(row)"
+                    >设为主父</el-button>
+                    <el-button v-if="!userStore.isViewer" size="small" type="danger" link @click="doRemoveParent(row)">
+                      删除
+                    </el-button>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <el-empty v-if="!(detail.parents || []).length" description="暂无父概念" :image-size="60" />
             </el-tab-pane>
             <el-tab-pane label="图" name="graph">
               <div v-if="graphNodes.length" class="graph-pane">
@@ -150,9 +198,61 @@
                 </div>
               </div>
               <el-empty v-else description="暂无相邻关系或互斥公理" :image-size="60" />
+
+              <el-divider content-position="left">传递闭包</el-divider>
+              <div class="closure-tool">
+                <el-select
+                  v-model="closureRelation"
+                  placeholder="选择传递关系"
+                  style="width: 220px"
+                  size="small"
+                >
+                  <el-option
+                    v-for="name in transitiveRelations"
+                    :key="name"
+                    :label="name"
+                    :value="name"
+                  />
+                </el-select>
+                <el-button
+                  size="small"
+                  type="primary"
+                  plain
+                  :disabled="!closureRelation"
+                  :loading="loadingClosure"
+                  @click="runClosure"
+                >查询可达概念</el-button>
+                <span v-if="!transitiveRelations.length" class="closure-tip">
+                  当前概念没有声明「传递」公理的关系
+                </span>
+              </div>
+              <template v-if="closureResult">
+                <div v-if="closureResult.count > 0" class="closure-result">
+                  <div
+                    v-for="depth in Object.keys(closureLayers).sort()"
+                    :key="depth"
+                    class="closure-layer"
+                  >
+                    <span class="closure-depth">第 {{ depth }} 跳</span>
+                    <el-tag
+                      v-for="c in closureLayers[depth]"
+                      :key="c"
+                      size="small"
+                      effect="plain"
+                      class="closure-tag"
+                    >{{ conceptNameOf(c) }}（{{ c }}）</el-tag>
+                  </div>
+                </div>
+                <el-alert
+                  v-else
+                  type="info"
+                  :closable="false"
+                  title="该概念在此关系上无传递可达"
+                />
+              </template>
             </el-tab-pane>
             <el-tab-pane label="互斥" name="disjoint">
-              <div class="pane-toolbar">
+              <div class="pane-toolbar" v-if="!userStore.isViewer">
                 <el-button size="small" type="primary" @click="openDisjointDialog">新增互斥</el-button>
               </div>
               <el-table :data="disjointPairs" v-loading="loadingDisjoint" size="small">
@@ -166,7 +266,7 @@
                 <el-table-column prop="definition" label="理由" show-overflow-tooltip />
                 <el-table-column label="操作" width="70">
                   <template #default="{ row }">
-                    <el-button size="small" type="danger" link @click="removeDisjoint(row)">
+                    <el-button v-if="!userStore.isViewer" size="small" type="danger" link @click="removeDisjoint(row)">
                       删除
                     </el-button>
                   </template>
@@ -195,7 +295,8 @@
                   IRI：
                   <span>{{ detail.concept?.iri || '未设置' }}</span>
                 </p>
-                <el-button-group>
+                <template v-if="!userStore.isViewer">
+                  <el-button-group>
                   <el-button
                     :disabled="!canTransition('REVIEW')"
                     :loading="transitioning"
@@ -220,23 +321,31 @@
                     @click="doTransition('DEPRECATED')"
                   >废弃</el-button>
                 </el-button-group>
-                <el-divider />
-                <el-button @click="openConceptDialog('edit')">编辑概念信息</el-button>
-                <el-tooltip
-                  content="仅草稿状态可删除"
-                  :disabled="detail.concept?.status === 'DRAFT'"
-                  placement="top"
-                >
-                  <span>
-                    <el-button
-                      type="danger"
-                      plain
-                      :disabled="detail.concept?.status !== 'DRAFT'"
-                      :loading="deletingConcept"
-                      @click="removeConcept"
-                    >删除概念</el-button>
-                  </span>
-                </el-tooltip>
+                  <el-divider />
+                  <el-button @click="openConceptDialog('edit')">编辑概念信息</el-button>
+                  <el-tooltip
+                    content="仅草稿状态可删除"
+                    :disabled="detail.concept?.status === 'DRAFT'"
+                    placement="top"
+                  >
+                    <span>
+                      <el-button
+                        type="danger"
+                        plain
+                        :disabled="detail.concept?.status !== 'DRAFT'"
+                        :loading="deletingConcept"
+                        @click="removeConcept"
+                      >删除概念</el-button>
+                    </span>
+                  </el-tooltip>
+                </template>
+                <el-alert
+                  v-else
+                  type="info"
+                  :closable="false"
+                  title="只读角色无写权限"
+                  style="margin-top: 8px"
+                />
               </div>
             </el-tab-pane>
           </el-tabs>
@@ -424,6 +533,29 @@
           </template>
         </el-dialog>
 
+        <!-- 添加父概念（抽屉内弹窗，需 append-to-body） -->
+        <el-dialog v-model="parentDialogVisible" title="添加父概念" width="480px" append-to-body>
+          <el-form :model="parentForm" label-width="90px">
+            <el-form-item label="父概念" required>
+              <el-select v-model="parentForm.parentCode" filterable style="width: 100%">
+                <el-option
+                  v-for="c in parentCandidates"
+                  :key="c.code"
+                  :label="`${c.name}（${c.code}）`"
+                  :value="c.code"
+                />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="设为主父">
+              <el-switch v-model="parentForm.isPrimary" :active-value="1" :inactive-value="0" />
+            </el-form-item>
+          </el-form>
+          <template #footer>
+            <el-button @click="parentDialogVisible = false">取消</el-button>
+            <el-button type="primary" :loading="savingParent" @click="submitParent">保存</el-button>
+          </template>
+        </el-dialog>
+
         <!-- 新增互斥公理（抽屉内弹窗，需 append-to-body） -->
         <el-dialog v-model="disjointDialogVisible" title="新增互斥公理" width="520px" append-to-body>
           <el-form :model="disjointForm" label-width="90px">
@@ -561,7 +693,7 @@
                 <el-table-column label="最近出现" width="150">
                   <template #default="{ row }">{{ formatMissTime(row.lastSeen) }}</template>
                 </el-table-column>
-                <el-table-column label="操作" width="170" fixed="right">
+                <el-table-column v-if="!userStore.isViewer" label="操作" width="170" fixed="right">
                   <template #default="{ row }">
                     <el-button
                       size="small"
@@ -607,7 +739,7 @@
                     <span class="miss-count" :class="{ hot: row.count >= 3 }">{{ row.count }}</span>
                   </template>
                 </el-table-column>
-                <el-table-column label="操作" width="90" fixed="right">
+                <el-table-column v-if="!userStore.isViewer" label="操作" width="90" fixed="right">
                   <template #default="{ row }">
                     <el-button size="small" type="primary" link @click="doUndismiss(row)">
                       撤销忽略
@@ -636,7 +768,7 @@
                 <el-table-column label="最近出现" width="150">
                   <template #default="{ row }">{{ formatMissTime(row.lastSeen) }}</template>
                 </el-table-column>
-                <el-table-column label="操作" width="90" fixed="right">
+                <el-table-column v-if="!userStore.isViewer" label="操作" width="90" fixed="right">
                   <template #default="{ row }">
                     <el-button size="small" type="danger" link @click="doRevoke(row)">
                       撤销采纳
@@ -800,11 +932,16 @@ import {
   adoptMissAsTerm,
   revokeMiss,
   classifyMiss,
-  deleteConcept
+  deleteConcept,
+  addParent,
+  removeParent,
+  setPrimaryParent,
+  relationClosure
 } from '../../api/ontology'
 import { getArchitectureOverview } from '../../api/architecture'
 import { statusText, statusTagType } from '../../utils/dict'
 import { useConceptStore } from '../../store/concept'
+import { useUserStore } from '../../store/user'
 import GraphCanvas from '../../components/GraphCanvas.vue'
 import RulePanel from './components/RulePanel.vue'
 import ActionPanel from './components/ActionPanel.vue'
@@ -813,6 +950,7 @@ import ReleasePanel from './components/ReleasePanel.vue'
 import AxiomPanel from './components/AxiomPanel.vue'
 
 const conceptStore = useConceptStore()
+const userStore = useUserStore()
 const route = useRoute()
 
 const activeTab = ref('modeling')
@@ -901,6 +1039,8 @@ const openDetail = async (row, innerTab = 'attrs') => {
   detail.value = await conceptDetail(row.code)
   activeInnerTab.value = innerTab
   drawerVisible.value = true
+  closureRelation.value = ''
+  closureResult.value = null
   loadDisjoint()
 }
 
@@ -1130,6 +1270,91 @@ const removeRelation = async (row) => {
   await refreshDetail()
 }
 
+// ---------- 多父继承 ----------
+const conceptNameOf = (code) =>
+  conceptStore.concepts.find((c) => c.code === code)?.name || ''
+
+const parentDialogVisible = ref(false)
+const savingParent = ref(false)
+const parentForm = reactive({ parentCode: '', isPrimary: 0 })
+
+// 候选父概念：排除自身与已是父的概念
+const parentCandidates = computed(() => {
+  const self = detail.value.concept?.code
+  const existing = new Set((detail.value.parents || []).map((p) => p.parentCode))
+  return conceptStore.concepts.filter((c) => c.code !== self && !existing.has(c.code))
+})
+
+const openParentDialog = () => {
+  Object.assign(parentForm, { parentCode: '', isPrimary: 0 })
+  parentDialogVisible.value = true
+}
+
+const submitParent = async () => {
+  if (!parentForm.parentCode) {
+    ElMessage.warning('请选择父概念')
+    return
+  }
+  savingParent.value = true
+  try {
+    await addParent(detail.value.concept.code, { ...parentForm })
+    ElMessage.success('父概念已添加')
+    parentDialogVisible.value = false
+    await refreshDetail()
+  } finally {
+    savingParent.value = false
+  }
+}
+
+const doSetPrimaryParent = async (row) => {
+  await setPrimaryParent(detail.value.concept.code, row.parentCode)
+  ElMessage.success('已设为主父')
+  await refreshDetail()
+}
+
+const doRemoveParent = async (row) => {
+  await ElMessageBox.confirm(
+    `确认移除父概念「${row.parentCode}」？`,
+    '提示',
+    { type: 'warning' }
+  )
+  await removeParent(detail.value.concept.code, row.parentCode)
+  ElMessage.success('已删除')
+  await refreshDetail()
+}
+
+// ---------- 传递闭包（图 tab 小工具） ----------
+const closureRelation = ref('')
+const loadingClosure = ref(false)
+const closureResult = ref(null)
+
+// 可选关系：当前概念声明了传递公理的关系名
+const transitiveRelations = computed(() => [
+  ...new Set(
+    (detail.value.relations || []).filter((r) => r.isTransitive === 1).map((r) => r.relationName)
+  )
+])
+
+const closureLayers = computed(() => {
+  const layers = {}
+  for (const r of closureResult.value?.reachable || []) {
+    ;(layers[r.depth] ||= []).push(r.concept)
+  }
+  return layers
+})
+
+const runClosure = async () => {
+  loadingClosure.value = true
+  try {
+    closureResult.value = await relationClosure(
+      closureRelation.value,
+      detail.value.concept.code
+    )
+  } finally {
+    loadingClosure.value = false
+  }
+}
+
 // ---------- 邻域图（「图」tab）----------
 const overviewData = ref(null)
 const loadingGraph = ref(false)
@@ -1353,8 +1578,8 @@ const adoptedMisses = computed(() =>
 
 const missKindText = (k) => ({ CONCEPT: '概念', ATTRIBUTE: '属性', QUESTION: '问题' }[k] || k)
 const missKindTag = (k) => ({ CONCEPT: 'primary', ATTRIBUTE: 'info', QUESTION: 'success' }[k] || 'info')
-const missSourceText = (s) => ({ SEARCH: '搜索未命中', MAPPING_AI: '映射失败', CS_ASK: '客服问答未命中' }[s] || s)
-const missSourceTag = (s) => ({ SEARCH: 'danger', MAPPING_AI: 'warning', CS_ASK: 'success' }[s] || 'info')
+const missSourceText = (s) => ({ SEARCH: '搜索未命中', MAPPING_AI: '映射失败', CS_ASK: '客服问答未命中', QA_ASK: '问数未命中' }[s] || s)
+const missSourceTag = (s) => ({ SEARCH: 'danger', MAPPING_AI: 'warning', CS_ASK: 'success', QA_ASK: 'success' }[s] || 'info')
 const formatMissTime = (t) => (t || '').replace('T', ' ')
 
 const loadMisses = async () => {
@@ -1693,5 +1918,43 @@ onMounted(async () => {
 
 .workflow-alert {
   margin-bottom: 12px;
+}
+
+.inherit-tip {
+  margin-left: 12px;
+  font-size: 12px;
+  color: #909399;
+}
+
+.parent-name {
+  margin-left: 8px;
+  color: #606266;
+}
+
+.closure-tool {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.closure-tip {
+  font-size: 12px;
+  color: #909399;
+}
+
+.closure-layer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 0;
+}
+
+.closure-depth {
+  font-size: 12px;
+  color: #909399;
+  width: 60px;
+  flex-shrink: 0;
 }
 </style>

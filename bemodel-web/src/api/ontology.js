@@ -20,6 +20,18 @@ export const updateConcept = (data) => request.put('/concept', data)
 // 仅 DRAFT 可删；有引用时后端报错 msg 携带引用计数
 export const deleteConcept = (code) => request.delete(`/concept/${code}`)
 
+// ---------- 多父继承 ----------
+export const listParents = (code) => request.get(`/concept/${code}/parents`)
+
+// body: { parentCode, isPrimary(0/1) }；成环后端 500，msg 由拦截器展示
+export const addParent = (code, data) => request.post(`/concept/${code}/parents`, data)
+
+export const removeParent = (code, parentCode) =>
+  request.delete(`/concept/${code}/parents/${parentCode}`)
+
+export const setPrimaryParent = (code, parentCode) =>
+  request.put(`/concept/${code}/parents/${parentCode}/primary`)
+
 export const transitionConcept = (code, target) =>
   request.post(`/concept/transition/${code}`, null, { params: { target } })
 
@@ -84,6 +96,10 @@ export const deleteDisjoint = (id) => request.delete(`/ontology/disjoint/${id}`)
 
 // ---------- 本体自检 ----------
 export const checkOntology = () => request.post('/ontology/check')
+
+// ---------- 传递闭包 ----------
+export const relationClosure = (relation, concept) =>
+  request.get('/ontology/relation/closure', { params: { relation, concept } })
 
 // ---------- OWL 导入 ----------
 export const previewOwlImport = (file) => {

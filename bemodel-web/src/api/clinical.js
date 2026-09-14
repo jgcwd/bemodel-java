@@ -12,5 +12,8 @@ export const checkAllQc = () => request.post('/qc/check-all')
 
 export const qcResult = (recordId) => request.get(`/qc/result/${recordId}`)
 
+// ---------- SHACL 复核（平台内置 Jena 校验） ----------
+export const validateRdf = (inhosNo) => request.post(`/rdf/validate/${inhosNo}`)
+
 // ---------- 危重症预警 ----------
 export const detectAlerts = () => request.post('/alert/detect')

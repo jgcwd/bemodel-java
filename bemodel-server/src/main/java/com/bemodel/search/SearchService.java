@@ -33,6 +33,11 @@ public class SearchService {
     private final MissService missService;
 
     public Map<String, Object> search(String q) {
+        return search(q, true);
+    }
+
+    /** recordMiss=false 用于问数场景口径卡前置试探：未命中还会继续进语义层，不应记词表外缺口 */
+    public Map<String, Object> search(String q, boolean recordMiss) {
         String query = q == null ? "" : q.trim();
         List<Map<String, Object>> hits = new ArrayList<>();
 
@@ -52,18 +57,21 @@ public class SearchService {
                         "content", c.getDefinition() == null ? "" : c.getDefinition()));
             }
         }
-        for (Metric m : metricMapper.selectList(null)) {
+        for (Metric m : metricMapper.selectList(
+                new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<Metric>().orderByAsc(Metric::getId))) {
             if (nameMatch(query, m.getName()) || defMatch(query, m.getDefinition())) {
                 hits.add(Map.of("type", "指标",
                         "title", m.getName() + "（负责人：" + (m.getOwner() == null ? "-" : m.getOwner()) + "）",
                         "conceptCode", m.getConceptCode() == null ? "" : m.getConceptCode(),
+                        "metricCode", m.getMetricCode() == null ? "" : m.getMetricCode(),
+                        "name", m.getName() == null ? "" : m.getName(),
                         "content", "口径：" + m.getDefinition()
                                 + " 公式：" + (m.getFormula() == null ? "-" : m.getFormula())));
             }
         }
 
         // 本体增长回路：概念维度零命中才记"词表外说法"——指标/术语命中不算 miss
-        if (hits.isEmpty()) {
+        if (hits.isEmpty() && recordMiss) {
             missService.recordMiss(query, "CONCEPT", "SEARCH");
         }
 

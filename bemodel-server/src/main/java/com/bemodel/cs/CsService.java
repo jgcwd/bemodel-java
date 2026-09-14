@@ -2,6 +2,8 @@ package com.bemodel.cs;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.bemodel.common.BizException;
+import com.bemodel.common.PageResult;
+import com.bemodel.cs.mapper.CsFeedbackMapper;
 import com.bemodel.datasource.service.DatasourceService;
 import com.bemodel.link.entity.LinkNode;
 import com.bemodel.link.service.LinkService;
@@ -44,6 +46,9 @@ public class CsService {
     private final com.bemodel.flow.FlowService flowService;
     private final com.bemodel.search.SearchService searchService;
     private final SemanticQaService semanticQaService;
+    private final CsFeedbackMapper csFeedbackMapper;
+    private final com.bemodel.ontology.mapper.ConceptMapper conceptMapper;
+    private final com.bemodel.ontology.mapper.MetricMapper metricMapper;
 
     /**
      * 工单智能诊断：已有完成的诊断直接复用，否则自动执行（客服无感，打开即得结论）。
@@ -168,39 +173,64 @@ public class CsService {
 
     // ==================== 问一问：免培训的自然语言入口 ====================
 
-    /**
-     * 客服问答：自然语言问题 → 意图路由 → 调用平台真实能力（跨库查询/主数据/口径库/语义层Ontology2SQL）→
-     * 结构化回答（结论 + 证据 + 可跳转的处置入口）。规则路由保证演示确定性；
-     * LLM 负责意图归类与答案组织，数字一律来自真实查询，不可用也能完整作答。
-     */
+    /** 提问场景：CS=AI客服（答「这笔业务该怎么办」）；ANALYTICS=智能问数（答「数字是多少/口径是什么」） */
+    public static final String SCENE_CS = "CS";
+    public static final String SCENE_ANALYTICS = "ANALYTICS";
+
+    static String normalizeScene(String scene) {
+        return SCENE_ANALYTICS.equalsIgnoreCase(scene == null ? "" : scene.trim())
+                ? SCENE_ANALYTICS : SCENE_CS;
+    }
+
+    /** 兼容旧调用（工单诊断反馈回路/历史测试）：缺省按客服场景 */
     public Map<String, Object> ask(String question) {
+        return ask(question, SCENE_CS);
+    }
+
+    /**
+     * 场景化问答：同一语义引擎按提问场景走不同路由偏好与兜底形态——
+     * CS=客服：7 类专属处置意图 + 语义层，兜底能力菜单（转介问数）；
+     * ANALYTICS=问数：口径进 Glossary、业务事实一律进语义层（Ontology2SQL），
+     * 兜底场景菜单（转介客服）。LLM 只做意图归类，数字一律来自真实查询。
+     */
+    public Map<String, Object> ask(String question, String scene) {
         String q = question == null ? "" : question.trim();
-        // LLM 语义分类为主路由（有 key 时）；无 key 降级为关键词匹配。
-        // 无论哪条路，作答都走同一批真实查询处理器——LLM 只做意图归类，不生成答案内容。
+        boolean analytics = SCENE_ANALYTICS.equals(normalizeScene(scene));
         String intent = null;
         String router = "NONE";
+        // 问数场景：显式口径触发词先试指标口径卡（口径与探针SQL在指标库，语义层答不了公式类问题）。
+        // 仅名称直命中的指标真出卡时才提前返回（router=RULE，未命中不记缺口）；
+        // 概念/术语文本命中继续原路由——数据型问法（如「缴费总额怎么算」）仍可被 LLM 改判进语义层查真实数据
+        if (analytics && matches(q, "口径", "怎么算", "什么是", "什么叫", "定义")) {
+            Map<String, Object> g = glossaryAnswer(q, false, true);
+            if (g != null && "METRIC".equals(g.get("card"))) {
+                g.putIfAbsent("router", "RULE");
+                return g;
+            }
+        }
         if (deepSeekClient.enabled()) {
-            intent = routeByLlm(q);
+            intent = routeByLlm(q, analytics);
             if (intent != null) {
                 router = "LLM";
             }
         }
         if (intent == null) {
-            intent = routeByKeyword(q);
+            intent = routeByKeyword(q, analytics);
             if (intent != null) {
                 router = "RULE";
             }
         }
-        // 语义路径单列：答不了时问题已回流增长回路，菜单需诚实提示
+        // 语义路径单列：答不了时问题已回流增长回路，missRecorded 供前端显式判断（不做字符串嗅探）
         if ("SEMANTIC_QUERY".equals(intent)) {
-            SemanticQaService.Outcome outcome = semanticQaService.answer(q);
+            SemanticQaService.Outcome outcome = semanticQaService.answer(q, analytics);
             if (outcome.result() != null) {
                 outcome.result().putIfAbsent("router", router); // 语义查询处理器自带 router=SEMANTIC
                 return outcome.result();
             }
-            Map<String, Object> menu = capabilityMenu(q);
+            Map<String, Object> menu = analytics ? analyticsMenu(q) : capabilityMenu(q);
             menu.put("router", router);
             if (outcome.recordedMiss()) {
+                menu.put("missRecorded", true);
                 menu.put("answer", menu.get("answer")
                         + "这个问题已记录为本体完善提案（本体页-扩展提案可见）。");
             }
@@ -211,12 +241,26 @@ public class CsService {
             r.putIfAbsent("router", router);
             return r;
         }
-        Map<String, Object> menu = capabilityMenu(q);
-        menu.put("router", intent != null ? router : "NONE");
+        // 未命中 → 场景化兜底菜单（内含向另一场景带原问题的转介入口），显式 REFERRAL 标记
+        Map<String, Object> menu = analytics ? analyticsMenu(q) : capabilityMenu(q);
+        menu.put("router", intent != null ? router : "REFERRAL");
         return menu;
     }
 
-    private String routeByKeyword(String q) {
+    private String routeByKeyword(String q, boolean analytics) {
+        if (analytics) {
+            // 问数场景：口径定义留 Glossary，其余业务词一律进语义层（本体已映射这些表，可真实查询）
+            if (matches(q, "口径", "怎么算", "什么是", "什么叫", "定义")) {
+                return "GLOSSARY";
+            }
+            if (matches(q, "取消", "撤销", "未退", "多收", "退费", "收费", "分开发药", "分次发药", "多次发药",
+                    "拆零", "分批", "退药", "退掉", "退货", "发药", "拿药", "取药", "买药", "药费", "缴费",
+                    "耗材", "物资", "申领", "库存", "医生", "护士", "药师", "技师", "谁", "科室", "人员",
+                    "多少", "哪些", "几条", "统计", "记录", "名单", "合计", "总额", "排名")) {
+                return "SEMANTIC_QUERY";
+            }
+            return null;
+        }
         if (matches(q, "取消", "撤销", "未退", "多收", "退费", "收费")) {
             return "FEE";
         }
@@ -241,9 +285,28 @@ public class CsService {
         return null;
     }
 
-    private String routeByLlm(String q) {
+    private String routeByLlm(String q, boolean analytics) {
         Optional<String> r = deepSeekClient.chat("CS_ROUTE",
                 "你是医院信息平台的意图分类器，只输出标签本身，不要任何解释。",
+                analytics ? analyticsRoutePrompt(q) : routePrompt(q));
+        if (r.isEmpty()) {
+            return null;
+        }
+        String label = r.get().trim().toUpperCase().replaceAll("[^A-Z_]", "");
+        if (analytics) {
+            // 问数场景只认两类标签，客服处置意图不可达
+            return "GLOSSARY".equals(label) || "SEMANTIC_QUERY".equals(label) ? label : null;
+        }
+        return switch (label) {
+            case "FEE", "DISPENSE_PAY", "DISPENSE_SPLIT", "DISPENSE_RETURN", "MATERIAL", "STAFF", "GLOSSARY",
+                 "SEMANTIC_QUERY" -> label;
+            default -> null;
+        };
+    }
+
+    /** 路由提示词：标签说明 + 错例反馈回路（最近 10 条 correct=0 的评议附加在尾部）。包私有供测试 */
+    String routePrompt(String q) {
+        StringBuilder sb = new StringBuilder(
                 "把下面的用户问题分到最合适的一类，只回答标签（一个词）：\n"
                         + "FEE=费用投诉工单（取消未退费/多收费的投诉排查与处置）；\n"
                         + "DISPENSE_PAY=缴费与发药的双向核对（没缴费能否发药、已缴费未发药滞留）；\n"
@@ -262,17 +325,57 @@ public class CsService {
                         + "辨析：DISPENSE_PAY 处理「缴费与发药两个方向的对账」（含已缴费未发药滞留）；"
                         + "涉及缴费/发药/退药的「正常吗/可以吗」也归对应 DISPENSE_* 类，不进 SEMANTIC_QUERY；"
                         + "结算方式/合并结算等缴费发药域外的规则问题才选 SEMANTIC_QUERY。\n"
-                        + "示例：「已缴费未发药正常吗」→ DISPENSE_PAY；「多个患者的处方可以一起结算吗」→ SEMANTIC_QUERY。\n"
-                        + "问题：" + q);
-        if (r.isEmpty()) {
-            return null;
+                        + "示例：「已缴费未发药正常吗」→ DISPENSE_PAY；「多个患者的处方可以一起结算吗」→ SEMANTIC_QUERY。\n");
+        List<CsFeedback> mistakes = csFeedbackMapper.selectList(new LambdaQueryWrapper<CsFeedback>()
+                .eq(CsFeedback::getCorrect, 0).orderByDesc(CsFeedback::getId).last("LIMIT 10"));
+        if (!mistakes.isEmpty()) {
+            sb.append("以下是人工评议员标注的历史误分类（前车之鉴，类似问题不要再错）：\n");
+            for (CsFeedback f : mistakes) {
+                sb.append("- 问「").append(f.getQuestion()).append("」误归 ").append(f.getIntent());
+                if (f.getComment() != null && !f.getComment().isBlank()) {
+                    sb.append("；正确应为/备注：").append(f.getComment());
+                }
+                sb.append('\n');
+            }
         }
-        String label = r.get().trim().toUpperCase().replaceAll("[^A-Z_]", "");
-        return switch (label) {
-            case "FEE", "DISPENSE_PAY", "DISPENSE_SPLIT", "DISPENSE_RETURN", "MATERIAL", "STAFF", "GLOSSARY",
-                 "SEMANTIC_QUERY" -> label;
-            default -> null;
-        };
+        sb.append("问题：").append(q);
+        return sb.toString();
+    }
+
+    /** 问数场景路由提示词：只留口径与语义查询两类，客服处置意图不出现（包私有供测试） */
+    String analyticsRoutePrompt(String q) {
+        return "把下面的用户问题分到最合适的一类，只回答标签（一个词）：\n"
+                + "GLOSSARY=指标口径与名词定义（怎么算/什么是/叫什么/口径定义）；\n"
+                + "SEMANTIC_QUERY=对业务事实的开放查询（数量/明细/统计/状态/库存/金额/名单/人员/时间），"
+                + "以及业务规则类「能不能/可不可以/是否允许」问题，平台按本体映射查业务库或按本体结构推理回答。\n"
+                + "注意：本场景是数据分析问数，客诉排查、工单处置类服务咨询不属于本场景；"
+                + "任何带业务词的问题都优先考虑 SEMANTIC_QUERY。\n"
+                + "问题：" + q;
+    }
+
+    /** 路由反馈：记录一次问答归类评议（viewer 也可反馈） */
+    public CsFeedback saveFeedback(String question, String intent, String router,
+                                   Integer correct, String comment) {
+        if (question == null || question.isBlank()) {
+            throw new BizException("question 不能为空");
+        }
+        CsFeedback f = new CsFeedback();
+        f.setQuestion(question.trim());
+        f.setIntent(intent);
+        f.setRouter(router);
+        f.setCorrect(Integer.valueOf(1).equals(correct) ? 1 : 0);
+        f.setComment(comment);
+        csFeedbackMapper.insert(f);
+        return f;
+    }
+
+    /** 反馈分页（管理查看） */
+    public PageResult<CsFeedback> feedbackPage(int pageNum, int pageSize) {
+        long total = csFeedbackMapper.selectCount(null);
+        List<CsFeedback> list = csFeedbackMapper.selectList(new LambdaQueryWrapper<CsFeedback>()
+                .orderByDesc(CsFeedback::getId)
+                .last("LIMIT " + pageSize + " OFFSET " + (pageNum - 1) * pageSize));
+        return PageResult.of(list, total, pageNum, pageSize);
     }
 
     private Map<String, Object> dispatch(String intent, String q) {
@@ -480,22 +583,99 @@ public class CsService {
         return result;
     }
 
-    /** 意图：口径/定义/怎么算（无命中时返回 null，继续走后续路由） */
+    /** 意图：口径/定义/怎么算（无命中时返回 null，继续走后续路由）；dispatch 路径不出卡，形态与历史版本一致 */
     private Map<String, Object> glossaryAnswer(String q) {
-        Map<String, Object> search = searchService.search(q.replaceAll("(怎么算|什么是|什么叫|的口径|口径|定义)", ""));
+        return glossaryAnswer(q, true, false);
+    }
+
+    /**
+     * @param recordMiss 零命中时是否记词表外缺口（问数前置试探为 false：还会继续进语义层，不该记成本体缺口）
+     * @param allowCard  是否允许名称直命中的指标出口径卡（仅问数场景前置试探为 true）
+     */
+    private Map<String, Object> glossaryAnswer(String q, boolean recordMiss, boolean allowCard) {
+        String stripped = q.replaceAll("(怎么算|什么是|什么叫|的口径|口径|定义)", "").trim();
+        Map<String, Object> search = searchService.search(stripped, recordMiss);
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> hits = (List<Map<String, Object>>) search.get("hits");
         if (hits == null || hits.isEmpty()) {
             return null;
         }
-        Map<String, Object> result = baseResult(q);
+        // 口径定义挂在指标库上：名称直命中的指标出口径卡，多个命中取名称最长者（匹配信息量最大）；
+        // 仅定义顺带命中的指标不做卡（避免答非所问），退回术语/概念文本回答
         Map<String, Object> top = hits.get(0);
+        boolean metricCard = false;
+        for (Map<String, Object> h : hits) {
+            if (!"指标".equals(h.get("type")) || !nameHits(stripped, String.valueOf(h.get("name")))) {
+                continue;
+            }
+            if (!metricCard || String.valueOf(h.get("name")).length() > String.valueOf(top.get("name")).length()) {
+                top = h;
+                metricCard = true;
+            }
+        }
+        if (metricCard && !allowCard) {
+            top = hits.get(0); // 非问数场景保持历史文本形态，不附带卡片字段
+            metricCard = false;
+        }
+        Map<String, Object> result = baseResult(q);
         result.put("intent", "口径查询");
+        String llmAnswer = Boolean.TRUE.equals(search.get("llmUsed")) ? String.valueOf(search.get("answer")) : "";
         result.put("answer", "「" + top.get("title") + "」" + top.get("content")
-                + (Boolean.TRUE.equals(search.get("llmUsed")) ? "\n\n" + search.get("answer") : ""));
+                + (llmAnswer.isEmpty() ? "" : "\n\n" + llmAnswer));
         result.put("evidence", List.of(Map.of("label", "命中" + top.get("type"), "value", String.valueOf(top.get("title")))));
-        result.put("links", List.of(Map.of("label", "去统一口径页查看全部术语", "route", "/glossary")));
+        if (metricCard) {
+            // 口径卡：结构化字段全部取自 bm_metric 真实数据，卡上探针 SQL 与指标巡检执行同源
+            attachMetricCard(result, String.valueOf(top.get("metricCode")));
+            if ("METRIC".equals(result.get("card"))) {
+                result.put("answerLlm", llmAnswer); // 前端渲染口径卡时用它替代与卡片重复的结构化文本
+            }
+        } else {
+            result.put("links", List.of(Map.of("label", "去统一口径页查看全部术语", "route", "/glossary")));
+        }
         return result;
+    }
+
+    /** 名称直命中：指标名是问题的子串（或反向），与 SearchService#nameMatch 同口径 */
+    private boolean nameHits(String query, String name) {
+        return name != null && !name.isEmpty() && !query.isEmpty()
+                && (name.contains(query) || query.contains(name));
+    }
+
+    /** 附带口径卡：按 metricCode 回查指标库；查不到时 card 字段不置，前端按普通文本回答渲染（不做字符串嗅探） */
+    private void attachMetricCard(Map<String, Object> result, String metricCode) {
+        if (metricCode == null || metricCode.isEmpty()) {
+            result.put("links", List.of(Map.of("label", "去统一口径页查看全部术语", "route", "/glossary")));
+            return;
+        }
+        com.bemodel.ontology.entity.Metric m = metricMapper.selectOne(
+                new LambdaQueryWrapper<com.bemodel.ontology.entity.Metric>()
+                        .eq(com.bemodel.ontology.entity.Metric::getMetricCode, metricCode));
+        if (m == null) {
+            result.put("links", List.of(Map.of("label", "去统一口径页查看全部术语", "route", "/glossary")));
+            return;
+        }
+        // 与指标库页 hasProbe 同口径：探针 SQL 与数据源齐备才可执行检测，卡上文案不得夸大能力
+        boolean hasProbe = m.getProbeSql() != null && !m.getProbeSql().isBlank()
+                && m.getDsCode() != null && !m.getDsCode().isBlank();
+        Map<String, Object> card = new LinkedHashMap<>();
+        card.put("metricCode", m.getMetricCode());
+        card.put("name", m.getName());
+        card.put("definition", m.getDefinition());
+        card.put("formula", m.getFormula());
+        card.put("probeSql", m.getProbeSql());
+        card.put("dsCode", m.getDsCode());
+        card.put("hasProbe", hasProbe);
+        card.put("owner", m.getOwner());
+        card.put("warnThreshold", m.getWarnThreshold());
+        card.put("lastVal", m.getLastVal());
+        if (m.getLastEvalAt() != null) {
+            card.put("lastEvalAt", m.getLastEvalAt().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")));
+        }
+        result.put("card", "METRIC");
+        result.put("metric", card);
+        result.put("links", List.of(Map.of(
+                "label", hasProbe ? "去统一口径页看该指标（可执行检测）" : "去统一口径页查看该指标",
+                "route", "/glossary?metric=" + urlEncode(m.getMetricCode()))));
     }
 
     /** 兜底：能力菜单 */
@@ -512,8 +692,32 @@ public class CsService {
                 Map.of("label", "耗材库存", "value", "「一次性输液器还有多少库存？」→ 库存=Σ入-Σ出实时账"),
                 Map.of("label", "人员归属", "value", "「王芳是谁？」→ 科室/职称/业务足迹"),
                 Map.of("label", "指标口径", "value", "「出院人数怎么算？」→ 标准定义与负责人")));
-        result.put("links", List.of());
+        result.put("links", List.of(Map.of(
+                "label", "找数据？去智能问数继续提问",
+                "route", "/ask?q=" + urlEncode(q))));
         return result;
+    }
+
+    /** 问数场景兜底：诚实说明语义层边界，附真实已发布概念数与向 AI 客服的场景转介（不写本体缺口） */
+    private Map<String, Object> analyticsMenu(String q) {
+        long published = conceptMapper.selectCount(new LambdaQueryWrapper<com.bemodel.ontology.entity.Concept>()
+                .eq(com.bemodel.ontology.entity.Concept::getStatus, "PUBLISHED"));
+        Map<String, Object> result = baseResult(q);
+        result.put("intent", "场景引导");
+        result.put("answer", "本页面向数据问题：把提问解析为「概念→关系→物理表」的查询计划，SQL 经白名单校验后在业务库实时执行。"
+                + "这个问题暂时没有命中语义层能力——可以换个数据问法，或转 AI 客服处理业务咨询。"
+                + "当前发布版本体覆盖 " + published + " 个概念；语义层答不了的问题会自动回流概念缺口页，按提问热度生长。");
+        result.put("evidence", List.of(
+                Map.of("label", "已发布概念", "value", published + " 个（本体管理-发布版）"),
+                Map.of("label", "典型问法", "value", "「最近10条缴费记录」「出院人数怎么算」")));
+        result.put("links", List.of(Map.of(
+                "label", "业务咨询/投诉处置？去 AI 客服",
+                "route", "/cs?q=" + urlEncode(q))));
+        return result;
+    }
+
+    private String urlEncode(String s) {
+        return java.net.URLEncoder.encode(s == null ? "" : s, java.nio.charset.StandardCharsets.UTF_8);
     }
 
     private boolean matches(String q, String... keywords) {

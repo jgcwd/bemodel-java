@@ -15,6 +15,7 @@
         <div class="ds-meta">{{ ds.dbType }} · {{ ds.host }}:{{ ds.port }}/{{ ds.dbName }}</div>
         <div class="ds-meta">账号：{{ ds.username }}</div>
         <el-button
+          v-if="!userStore.isViewer"
           size="small"
           class="scan-btn"
           :loading="scanningDs === ds.dsCode"
@@ -58,9 +59,13 @@
                     {{ aiMeta.llmUsed ? `AI生成（${aiMeta.model}）` : '规则降级' }}
                   </el-tag>
                 </span>
-                <el-button type="primary" :loading="aiLoading" @click="runAiSuggest">
-                  AI 推荐映射
-                </el-button>
+                <el-tooltip content="只读角色无写权限" :disabled="!userStore.isViewer" placement="top">
+                  <span>
+                    <el-button type="primary" :disabled="userStore.isViewer" :loading="aiLoading" @click="runAiSuggest">
+                      AI 推荐映射
+                    </el-button>
+                  </span>
+                </el-tooltip>
               </div>
             </template>
             <el-table :data="rows" v-loading="loadingColumns">
@@ -110,6 +115,7 @@
                       </el-tag>
                     </el-tooltip>
                     <el-button
+                      v-if="!userStore.isViewer"
                       size="small"
                       link
                       type="primary"
@@ -120,7 +126,7 @@
                   <span v-else class="no-suggest">-</span>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" width="110" fixed="right">
+              <el-table-column v-if="!userStore.isViewer" label="操作" width="110" fixed="right">
                 <template #default="{ row }">
                   <el-button size="small" @click="openEdit(row)">编辑映射</el-button>
                 </template>
@@ -215,8 +221,10 @@ import {
 } from '../../api/datasource'
 import { conceptDetail } from '../../api/ontology'
 import { useConceptStore } from '../../store/concept'
+import { useUserStore } from '../../store/user'
 
 const conceptStore = useConceptStore()
+const userStore = useUserStore()
 
 // ---------- 数据源 ----------
 const datasources = ref([])

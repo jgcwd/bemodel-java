@@ -27,8 +27,7 @@ public class DatasourceController {
 
     @PostMapping
     public Result<Datasource> create(@RequestBody Datasource ds) {
-        datasourceService.save(ds);
-        return Result.ok(ds);
+        return Result.ok(datasourceService.create(ds));
     }
 
     @PostMapping("/test")

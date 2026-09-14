@@ -1,6 +1,7 @@
 package com.bemodel.ontology.controller;
 
 import com.bemodel.common.Result;
+import com.bemodel.modeling.service.ReleaseService;
 import com.bemodel.ontology.entity.Concept;
 import com.bemodel.ontology.entity.Disjoint;
 import com.bemodel.ontology.entity.OntologyMiss;
@@ -25,6 +26,7 @@ public class OntologyController {
     private final DisjointService disjointService;
     private final OntologyCheckService ontologyCheckService;
     private final MissService missService;
+    private final ReleaseService releaseService;
 
     // ---------- 概念互斥 ----------
 
@@ -93,5 +95,13 @@ public class OntologyController {
     @PostMapping("/misses/{id}/classify")
     public Result<Map<String, Object>> missClassify(@PathVariable Long id) {
         return Result.ok(Map.of("suggestion", missService.classify(id)));
+    }
+
+    // ---------- 传递闭包（发布时物化，此处只读） ----------
+
+    @GetMapping("/relation/closure")
+    public Result<Map<String, Object>> relationClosure(@RequestParam String relation,
+                                                       @RequestParam String concept) {
+        return Result.ok(releaseService.closureOf(relation, concept));
     }
 }
