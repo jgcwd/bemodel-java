@@ -66,7 +66,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Compose reads the database/API credentials from the Actions environment.
+          # Compose reads credentials from the Actions environment.
           # No .env file containing secrets is written to the server.
           docker compose -f docker-compose.yml down --remove-orphans || true
           docker compose -f docker-compose.yml build --pull
@@ -80,15 +80,15 @@ jobs:
           echo 'Container status:'
           docker compose -f docker-compose.yml ps
 
-          echo 'Waiting for backend...'
+          echo 'Waiting for backend TCP port...'
           for i in {1..45}; do
-            if curl -fsS "http://127.0.0.1:18080/" >/dev/null 2>&1; then
+            if (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1; then
               break
             fi
             sleep 2
           done
 
-          if ! curl -fsS "http://127.0.0.1:18080/" >/dev/null 2>&1; then
+          if ! (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1; then
             echo 'Backend did not become reachable.'
             docker compose -f docker-compose.yml logs --tail=150 backend || true
             exit 1
