@@ -16,6 +16,7 @@ services:
       - --bind-address=0.0.0.0
     volumes:
       - bemodel_mysql_data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
     ports:
       - "3306:3306"
     healthcheck:
