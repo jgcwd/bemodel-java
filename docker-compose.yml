@@ -16,7 +16,6 @@ services:
       - --bind-address=0.0.0.0
     volumes:
       - bemodel_mysql_data:/var/lib/mysql
-      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
     ports:
       - "3306:3306"
     healthcheck:
@@ -37,8 +36,8 @@ services:
       MYSQL_HOST: mysql
       MYSQL_PORT: 3306
       MYSQL_DATABASE: ${MYSQL_DATABASE:-bemodel_platform}
-      MYSQL_USERNAME: ${MYSQL_USERNAME}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_USERNAME: root
+      MYSQL_PASSWORD: ${MYSQL_ROOT_PASSWORD}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       JWT_SECRET: ${JWT_SECRET}
       APP_SECRET_KEY: ${APP_SECRET_KEY}
