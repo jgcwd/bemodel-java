@@ -1,11 +1,10 @@
 -- =============================================================
 -- V2: 模拟三条产品线的物理库（表结构各自为政、口径互相割裂）
 -- demo_his(住院HIS) / demo_lis(检验LIS) / demo_charge(收费系统)
+--
+-- demo_his/demo_lis/demo_charge are created by the MySQL container
+-- initialization script with root privileges before Flyway starts.
 -- =============================================================
-
-CREATE DATABASE IF NOT EXISTS demo_his DEFAULT CHARSET utf8mb4;
-CREATE DATABASE IF NOT EXISTS demo_lis DEFAULT CHARSET utf8mb4;
-CREATE DATABASE IF NOT EXISTS demo_charge DEFAULT CHARSET utf8mb4;
 
 -- ---------- demo_his：住院HIS ----------
 CREATE TABLE IF NOT EXISTS demo_his.inpatient (
