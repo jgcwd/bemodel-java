@@ -12,6 +12,10 @@ RUN mvn -B -f bemodel-server/pom.xml clean package -DskipTests
 FROM eclipse-temurin:21-jre
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /build/bemodel-server/target/bemodel-server-1.0.0.jar /app/bemodel-server.jar
 
 EXPOSE 18080
