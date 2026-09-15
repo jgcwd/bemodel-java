@@ -14,8 +14,8 @@ concurrency:
 
 jobs:
   deploy:
-    name: Docker deploy on ubuntu4
-    runs-on: [self-hosted, ubuntu4]
+    name: Docker deploy on ubuntu1
+    runs-on: [self-hosted, ubuntu1]
     timeout-minutes: 30
 
     env:
