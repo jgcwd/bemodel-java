@@ -21,11 +21,10 @@ jobs:
     env:
       APP_DIR: /opt/bemodel-java
       FRONTEND_PORT: 18081
-      MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
-      MYSQL_PORT: ${{ secrets.MYSQL_PORT }}
-      MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE }}
+      MYSQL_DATABASE: ${{ secrets.MYSQL_DATABASE || 'bemodel_platform' }}
       MYSQL_USERNAME: ${{ secrets.MYSQL_USERNAME }}
       MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+      MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
       JWT_SECRET: ${{ secrets.JWT_SECRET }}
       APP_SECRET_KEY: ${{ secrets.APP_SECRET_KEY }}
@@ -53,7 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          required=(MYSQL_USERNAME MYSQL_PASSWORD DEEPSEEK_API_KEY JWT_SECRET APP_SECRET_KEY)
+          required=(MYSQL_USERNAME MYSQL_PASSWORD MYSQL_ROOT_PASSWORD DEEPSEEK_API_KEY JWT_SECRET APP_SECRET_KEY)
           for name in "${required[@]}"; do
             if [[ -z "${!name:-}" ]]; then
               echo "ERROR: GitHub Actions secret $name is not configured."
@@ -66,8 +65,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Compose reads credentials from the Actions environment.
-          # No .env file containing secrets is written to the server.
+          # The MySQL data lives in the named Docker volume bemodel_mysql_data.
+          # Recreating containers does not delete the database volume.
           docker compose -f docker-compose.yml down --remove-orphans || true
           docker compose -f docker-compose.yml build --pull
           docker compose -f docker-compose.yml up -d --remove-orphans
@@ -80,7 +79,22 @@ jobs:
           echo 'Container status:'
           docker compose -f docker-compose.yml ps
 
-          echo 'Waiting for backend TCP port...'
+          echo 'Waiting for MySQL...'
+          for i in {1..45}; do
+            status=$(docker inspect --format '{{.State.Health.Status}}' bemodel-mysql 2>/dev/null || true)
+            if [[ "$status" == "healthy" ]]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$(docker inspect --format '{{.State.Health.Status}}' bemodel-mysql 2>/dev/null || true)" != "healthy" ]]; then
+            echo 'MySQL did not become healthy.'
+            docker compose -f docker-compose.yml logs --tail=150 mysql || true
+            exit 1
+          fi
+
+          echo 'Waiting for backend...'
           for i in {1..45}; do
             if (echo > /dev/tcp/127.0.0.1/18080) >/dev/null 2>&1; then
               break
@@ -103,7 +117,7 @@ jobs:
           done
 
           curl -fsS "http://127.0.0.1:${FRONTEND_PORT}/" >/dev/null
-          echo "Deployment successful: frontend :${FRONTEND_PORT}, backend :18080"
+          echo "Deployment successful: frontend :${FRONTEND_PORT}, backend :18080, mysql :3306"
 
       - name: Cleanup Docker resources
         if: success()
